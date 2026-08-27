@@ -111,6 +111,14 @@ if st.sidebar.button("💾 Simpan Skuad Saat Ini"):
     st.session_state['saved_squad'] = selected_squad_names
     st.sidebar.success("Skuad disimpan!")
 
+# Opsi Menu Rentang Transfer (1 - 5 Pemain)
+st.sidebar.subheader("🎯 Batas Evaluasi Transfer")
+target_transfer_mode = st.sidebar.select_slider(
+    "Pilih Batas Maksimal Transfer Ditinjau:",
+    options=[1, 2, 3, 4, 5],
+    value=4
+)
+
 free_transfers = st.sidebar.number_input("Jumlah Free Transfer Tersedia", min_value=1, max_value=5, value=1)
 bank_budget = st.sidebar.number_input("Sisa Anggaran di Bank (£M)", min_value=0.0, max_value=15.0, value=0.5, step=0.1)
 
@@ -119,28 +127,28 @@ squad_df = players_df[players_df['web_name'].isin(selected_squad_names)].copy()
 tab1, tab2, tab3 = st.tabs(["🔄 Rekomendasi Optimal (Fast)", "📋 Skuad Pasca-Transfer & Kapten", "🔍 Database Pemain"])
 
 # ---------------------------------------------------------
-# TAB 1: FAST OPTIMIZATION (PRUNED COMBINATIONS)
+# TAB 1: FAST OPTIMIZATION (PRUNED COMBINATIONS 1 - 5)
 # ---------------------------------------------------------
 with tab1:
     st.subheader("🎯 Hasil Transfer Paling Optimum")
-    st.caption("Algoritma mengoptimalkan pencarian dengan memprioritaskan pelepasan pemain berkinerja rendah/cedera.")
+    st.caption(f"Algorithmic Pruning aktif: Mengevaluasi skenario 1 s.d. {target_transfer_mode} transfer dengan memprioritaskan pelepasan pemain berkinerja rendah/cedera.")
 
     recommendations = []
     if len(squad_df) < 15:
         st.warning(f"Lengkapi 15 pemain di sidebar untuk menjalankan optimasi. (Saat ini: {len(squad_df)}/15)")
     else:
-        with st.spinner("Menghitung transfer optimum dalam hitungan detik..."):
-            # FILTER CERDAS 1: Pilih pemain keluar yang xP nya rendah atau terindikasi cedera
-            out_candidates = squad_df.sort_values(by=['chance_of_playing_next_round', 'xP'], ascending=[True, True]).head(7).to_dict('records')
+        with st.spinner(f"Menghitung kombinasi transfer 1-{target_transfer_mode} pemain..."):
+            # PRUNING 1: Batasi kandidat keluar ke 8 pemain berkinerja terburuk/cedera
+            out_candidates = squad_df.sort_values(by=['chance_of_playing_next_round', 'xP'], ascending=[True, True]).head(8).to_dict('records')
             
-            # FILTER CERDAS 2: Pilih kandidat pemain masuk Top 5 xP per posisi
+            # PRUNING 2: Batasi kandidat masuk ke Top 4 xP per posisi
             top_in_candidates = players_df[
                 (~players_df['web_name'].isin(selected_squad_names)) &
                 (players_df['chance_of_playing_next_round'].fillna(100) >= 75)
-            ].sort_values(by='xP', ascending=False).groupby('position').head(5).to_dict('records')
+            ].sort_values(by='xP', ascending=False).groupby('position').head(4).to_dict('records')
 
-            # EVALUASI SKENARIO 1 s.d. 4 TRANSFER
-            for n_transfers in range(1, 5):
+            # EVALUASI TERARAH BERDASARKAN TARGET USER (1 s.d. 5)
+            for n_transfers in range(1, target_transfer_mode + 1):
                 extra_transfers = max(0, n_transfers - free_transfers)
                 hit_penalty = extra_transfers * 4
 
