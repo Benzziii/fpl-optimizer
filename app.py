@@ -23,7 +23,6 @@ def load_fpl_data():
     players['now_cost'] = players['now_cost'] / 10.0
     players['form'] = pd.to_numeric(players['form'], errors='coerce').fillna(0)
     
-    # Menentukan Fixture & FDR Gameweek Berikutnya
     next_gw = None
     for event in bootstrap['events']:
         if event['is_next']:
@@ -61,7 +60,6 @@ except Exception as e:
     st.error("Failed to load FPL API data. Check internet connection.")
     st.stop()
 
-# Rumus Expected Points (xP)
 def calculate_expected_points(df):
     chance_mult = df['chance_of_playing_next_round'].fillna(100) / 100.0
     fdr_multiplier = df['next_fdr'].apply(lambda fdr: 1.25 if fdr <= 2 else (0.75 if fdr >= 4 else 1.0))
@@ -76,26 +74,56 @@ st.markdown("Aplikasi optimasi transfer, komposisi skuad pasca-transfer, dan sim
 # Sidebar - Parameter Skuad & Transfer
 st.sidebar.header("⚙️ Konfigurasi Tim & Transfer")
 
-free_transfers = st.sidebar.number_input("Jumlah Free Transfer Tersedia", min_value=1, max_value=5, value=1)
-bank_budget = st.sidebar.number_input("Sisa Anggaran di Bank (£M)", min_value=0.0, max_value=15.0, value=0.5, step=0.1)
+# Fitur Sync via Team ID
+st.sidebar.subheader("🆔 Sync Otomatis ID Tim FPL")
+team_id_input = st.sidebar.text_input("Masukkan FPL Team ID Anda:", placeholder="Contoh: 1234567")
 
-st.sidebar.subheader("📌 Masukkan Skuad Saat Ini")
 all_player_names = sorted(players_df['web_name'].unique())
+fetched_squad_names = []
 
-default_squad = all_player_names[:15] if len(all_player_names) >= 15 else []
+if team_id_input:
+    try:
+        # Ambil data picks Gameweek sebelumnya/terbaru dari API
+        current_gw = next_gw - 1 if next_gw > 1 else 1
+        entry_url = f"https://fantasy.premierleague.com/api/entry/{team_id_input}/event/{current_gw}/picks/"
+        res = requests.get(entry_url)
+        if res.status_code == 200:
+            picks_data = res.json().get('picks', [])
+            player_ids = [p['element'] for p in picks_data]
+            fetched_squad_names = players_df[players_df['id'].isin(player_ids)]['web_name'].tolist()
+            st.sidebar.success(f"Berhasil menarik 15 pemain dari ID: {team_id_input}!")
+        else:
+            st.sidebar.error("ID Tim tidak ditemukan atau API tidak merespons.")
+    except Exception:
+        st.sidebar.error("Gagal mengambil data dari FPL.")
+
+# Set default selection
+if fetched_squad_names:
+    default_selection = fetched_squad_names
+elif 'saved_squad' in st.session_state:
+    default_selection = st.session_state['saved_squad']
+else:
+    default_selection = all_player_names[:15] if len(all_player_names) >= 15 else []
+
+st.sidebar.subheader("📌 Masukkan/Ubah Skuad")
 selected_squad_names = st.sidebar.multiselect(
     "Pilih 15 Pemain dalam Tim Anda:",
     options=all_player_names,
-    default=default_squad
+    default=default_selection
 )
+
+if st.sidebar.button("💾 Simpan Skuad Saat Ini"):
+    st.session_state['saved_squad'] = selected_squad_names
+    st.sidebar.success("Skuad disimpan!")
+
+free_transfers = st.sidebar.number_input("Jumlah Free Transfer Tersedia", min_value=1, max_value=5, value=1)
+bank_budget = st.sidebar.number_input("Sisa Anggaran di Bank (£M)", min_value=0.0, max_value=15.0, value=0.5, step=0.1)
 
 squad_df = players_df[players_df['web_name'].isin(selected_squad_names)].copy()
 
 tab1, tab2, tab3 = st.tabs(["🔄 Rekomendasi Transfer", "📋 Skuad Pasca-Transfer & Kapten", "🔍 Database Pemain"])
 
-# ---------------------------------------------------------
-# TAB 1: REKOMENDASI TRANSFER OPTIMAL
-# ---------------------------------------------------------
+# TAB 1: REKOMENDASI TRANSFER
 with tab1:
     st.subheader("🎯 Rekomendasi Transfer Optimal")
     st.caption("Rekomendasi dihitung berdasarkan kenaikan Expected Points (xP Net Gain), FDR jadwal depan, status ketersediaan, dan sisa budget.")
@@ -143,9 +171,7 @@ with tab1:
         else:
             st.success("Skuad Anda saat ini sudah optimal. Tidak ada usulan transfer yang memberikan ROI poin signifikan.")
 
-# ---------------------------------------------------------
 # TAB 2: SKUAD BARU PASCA-TRANSFER & SIMULASI KAPTEN
-# ---------------------------------------------------------
 with tab2:
     st.subheader(f"📋 Analisis Skuad Baru Pasca-Transfer (GW {next_gw})")
     
@@ -154,7 +180,6 @@ with tab2:
     else:
         st.markdown("#### ⚙️ Pilih Pemain yang Ditransfer")
         
-        # Pilihan eksekusi transfer berdasarkan rekomendasi
         if not rec_df.empty:
             transfer_options = ["(Tanpa Transfer - Gunakan Skuad Asli)"] + [
                 f"Ganti {row['Pemain Keluar']} ➡️ {row['Pemain Masuk']} (+{row['Estimasi Net Gain Poin']} pts)"
@@ -165,7 +190,6 @@ with tab2:
             selected_transfer_str = "(Tanpa Transfer - Gunakan Skuad Asli)"
             st.info("Tidak ada rekomendasi transfer. Menampilkan analisis skuad asli Anda.")
 
-        # Bentuk Skuad Baru (Post-Transfer Squad)
         post_squad_names = selected_squad_names.copy()
         applied_penalty = 0
 
@@ -173,7 +197,6 @@ with tab2:
             idx = transfer_options.index(selected_transfer_str) - 1
             chosen_rec = rec_df.iloc[idx]
             
-            # Eksekusi penggantian pemain
             post_squad_names.remove(chosen_rec['Pemain Keluar'])
             post_squad_names.append(chosen_rec['Pemain Masuk'])
             
@@ -185,7 +208,6 @@ with tab2:
 
         st.divider()
 
-        # Rekomendasi Otomatis Kapten Skuad Baru
         top_captain = post_squad_df.iloc[0]['web_name']
         top_vc = post_squad_df.iloc[1]['web_name'] if len(post_squad_df) > 1 else top_captain
 
@@ -205,16 +227,12 @@ with tab2:
             index=0
         )
 
-        # Hitung Poin Expected Points Achieved Skuad Baru
         captain_xp = post_squad_df[post_squad_df['web_name'] == selected_captain]['xP'].values[0]
         base_squad_xp = post_squad_df['xP'].sum()
-        
-        # Poin Total Akhir = Base xP + Extra Captain xP - Transfer Hit Penalty
         final_achieved_xp = round(base_squad_xp + captain_xp - applied_penalty, 2)
 
         st.info(f"💡 **Rekomendasi Kapten Skuad Baru**: **{top_captain}** (Base xP: {post_squad_df.iloc[0]['xP']}) & Vice-Captain **{top_vc}**")
 
-        # Metric Displays
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total xP Achieved (GW Depan)", final_achieved_xp)
         col2.metric("Ekstra Poin Kapten", f"+{captain_xp} pts")
@@ -223,7 +241,6 @@ with tab2:
         flagged_players = post_squad_df[post_squad_df['chance_of_playing_next_round'] < 100]
         col4.metric("Pemain Cedera/Bermasalah", len(flagged_players))
 
-        # Labeling Skuad Baru
         post_squad_display = post_squad_df.copy()
         post_squad_display['Role'] = post_squad_display['web_name'].apply(
             lambda name: "👑 Captain" if name == selected_captain else ("🛡️ Vice-Captain" if name == selected_vc else "Player")
@@ -245,9 +262,7 @@ with tab2:
             use_container_width=True
         )
 
-# ---------------------------------------------------------
 # TAB 3: DATABASE PEMAIN
-# ---------------------------------------------------------
 with tab3:
     st.subheader("🔍 Database Pemain & Tren Performa")
     
