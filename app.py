@@ -70,11 +70,8 @@ def calculate_expected_points(df):
 players_df = calculate_expected_points(players_df)
 
 st.title(f"⚽ FPL Auto-Optimal Transfer & Squad Optimizer (GW {next_gw})")
-st.markdown("Sistem secara otomatis mengevaluasi kombinasi transfer (1-4 pemain) dan menyajikan skenario paling optimum.")
 
-# Sidebar - Parameter
 st.sidebar.header("⚙️ Konfigurasi Tim & Transfer")
-
 st.sidebar.subheader("🆔 Sync Otomatis ID Tim FPL")
 team_id_input = st.sidebar.text_input("Masukkan FPL Team ID Anda:", value="4231710")
 
@@ -119,39 +116,41 @@ bank_budget = st.sidebar.number_input("Sisa Anggaran di Bank (£M)", min_value=0
 
 squad_df = players_df[players_df['web_name'].isin(selected_squad_names)].copy()
 
-tab1, tab2, tab3 = st.tabs(["🔄 Rekomendasi Optimal (Auto)", "📋 Skuad Pasca-Transfer & Kapten", "🔍 Database Pemain"])
+tab1, tab2, tab3 = st.tabs(["🔄 Rekomendasi Optimal (Fast)", "📋 Skuad Pasca-Transfer & Kapten", "🔍 Database Pemain"])
 
 # ---------------------------------------------------------
-# TAB 1: EVALUASI OTOMATIS 1-4 TRANSFER
+# TAB 1: FAST OPTIMIZATION (PRUNED COMBINATIONS)
 # ---------------------------------------------------------
 with tab1:
-    st.subheader("🎯 Hasil Transfer Paling Optimum (Otomatis)")
-    st.caption("Algoritma secara otomatis menguji semua opsi (1 s.d. 4 transfer) dan menyajikan kombinasi dengan ROI Net Gain tertinggi.")
+    st.subheader("🎯 Hasil Transfer Paling Optimum")
+    st.caption("Algoritma mengoptimalkan pencarian dengan memprioritaskan pelepasan pemain berkinerja rendah/cedera.")
 
     recommendations = []
     if len(squad_df) < 15:
         st.warning(f"Lengkapi 15 pemain di sidebar untuk menjalankan optimasi. (Saat ini: {len(squad_df)}/15)")
     else:
-        with st.spinner("Mencari kombinasi transfer paling optimum dari skenario 1-4 pemain..."):
-            # Secara otomatis mengevaluasi rentang transfer 1 hingga 4
+        with st.spinner("Menghitung transfer optimum dalam hitungan detik..."):
+            # FILTER CERDAS 1: Pilih pemain keluar yang xP nya rendah atau terindikasi cedera
+            out_candidates = squad_df.sort_values(by=['chance_of_playing_next_round', 'xP'], ascending=[True, True]).head(7).to_dict('records')
+            
+            # FILTER CERDAS 2: Pilih kandidat pemain masuk Top 5 xP per posisi
+            top_in_candidates = players_df[
+                (~players_df['web_name'].isin(selected_squad_names)) &
+                (players_df['chance_of_playing_next_round'].fillna(100) >= 75)
+            ].sort_values(by='xP', ascending=False).groupby('position').head(5).to_dict('records')
+
+            # EVALUASI SKENARIO 1 s.d. 4 TRANSFER
             for n_transfers in range(1, 5):
                 extra_transfers = max(0, n_transfers - free_transfers)
                 hit_penalty = extra_transfers * 4
 
-                for out_comb in combinations(squad_df.to_dict('records'), n_transfers):
+                for out_comb in combinations(out_candidates, n_transfers):
                     out_cost_sum = sum([p['now_cost'] for p in out_comb])
                     out_xp_sum = sum([p['xP'] for p in out_comb])
                     available_budget = out_cost_sum + bank_budget
-
                     out_positions = [p['position'] for p in out_comb]
-                    
-                    candidate_pool = players_df[
-                        (~players_df['web_name'].isin(selected_squad_names)) &
-                        (players_df['chance_of_playing_next_round'].fillna(100) >= 75) &
-                        (players_df['position'].isin(out_positions))
-                    ].sort_values(by='xP', ascending=False).head(12).to_dict('records')
 
-                    for in_comb in combinations(candidate_pool, n_transfers):
+                    for in_comb in combinations(top_in_candidates, n_transfers):
                         in_positions = [p['position'] for p in in_comb]
                         if sorted(out_positions) == sorted(in_positions):
                             in_cost_sum = sum([p['now_cost'] for p in in_comb])
@@ -177,7 +176,6 @@ with tab1:
         if not rec_df.empty:
             rec_df = rec_df.sort_values(by='Net Gain (ROI)', ascending=False).drop_duplicates(subset=['Pemain Keluar', 'Pemain Masuk']).reset_index(drop=True)
             
-            # Highlight Pilihan Terbaik (Top 1)
             best_option = rec_df.iloc[0]
             st.success(f"🏆 **Rekomendasi Terbaik**: Lakukan **{best_option['Opsi Transfer']}** (Penalti: {best_option['Penalti Hit']}) untuk potensi peningkatan bersih **+{best_option['Net Gain (ROI)']} poin**!")
 
@@ -201,7 +199,6 @@ with tab2:
                 f"[{row['Opsi Transfer']} | {row['Penalti Hit']}] Out: {row['Pemain Keluar']} ➡️ In: {row['Pemain Masuk']} (+{row['Net Gain (ROI)']} pts)"
                 for _, row in rec_df.iterrows()
             ]
-            # Default ke opsi teratas (terbaik)
             selected_transfer_str = st.selectbox("Terapkan Hasil Transfer ke Skuad:", options=transfer_options, index=1)
         else:
             selected_transfer_str = "(Tanpa Transfer - Gunakan Skuad Asli)"
