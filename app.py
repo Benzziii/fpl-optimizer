@@ -6,21 +6,21 @@ import pulp
 from sklearn.ensemble import RandomForestRegressor
 
 # Config Halaman
-st.set_page_config(page_title="FPL Real-Matchup MILP Optimizer", layout="wide")
-st.title("⚽ FPL Realistic MILP & ML Optimizer")
+st.set_page_config(page_title="FPL Realistic MILP Optimizer", layout="wide")
+st.title("⚡ FPL Ultra Optimizer: Fixtures, Matchup & MILP")
 
 # -----------------------------------------------------------------------------
 # 1. FETCH DATA & FIXTURES FROM FPL API
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def fetch_fpl_bootstrap():
+def fetch_fpl_bootstrap_v2():
     url = "https://fantasy.premierleague.com/api/bootstrap-static/"
     res = requests.get(url)
     return res.json() if res.status_code == 200 else None
 
 @st.cache_data(ttl=3600)
-def fetch_next_fixtures():
-    bootstrap = fetch_fpl_bootstrap()
+def fetch_next_fixtures_v2():
+    bootstrap = fetch_fpl_bootstrap_v2()
     if not bootstrap: 
         return {}, None
     
@@ -45,7 +45,7 @@ def fetch_next_fixtures():
     return fixture_map, next_gw
 
 def fetch_user_fpl(entry_id):
-    bootstrap = fetch_fpl_bootstrap()
+    bootstrap = fetch_fpl_bootstrap_v2()
     if not bootstrap:
         return None, "Gagal terhubung ke API FPL."
     
@@ -78,7 +78,7 @@ def get_player_role(row):
 # 2. MACHINE LEARNING ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def predict_player_xp(df, teams_df, fixture_map):
+def predict_player_xp_v2(df, teams_df, fixture_map):
     df_feat = df.copy()
     
     df_feat['form'] = pd.to_numeric(df_feat['form'], errors='coerce').fillna(0)
@@ -100,6 +100,10 @@ def predict_player_xp(df, teams_df, fixture_map):
     df_feat['opponent_team_id'] = df_feat['team'].map(lambda t: fixture_map.get(t, {}).get('opponent_id', t))
     df_feat['is_home'] = df_feat['team'].map(lambda t: fixture_map.get(t, {}).get('is_home', 1))
     df_feat['fdr'] = df_feat['team'].map(lambda t: fixture_map.get(t, {}).get('fdr', 3))
+
+    teams_dict = {t["id"]: t["name"] for t in teams_df.to_dict('records')}
+    df_feat['opponent_name'] = df_feat['opponent_team_id'].map(teams_dict).fillna("Unknown")
+    df_feat['matchup_info'] = np.where(df_feat['is_home'] == 1, "vs " + df_feat['opponent_name'] + " (H)", "vs " + df_feat['opponent_name'] + " (A)")
 
     team_defense_stats = {}
     for team_id in teams_df['id']:
@@ -146,7 +150,7 @@ def predict_player_xp(df, teams_df, fixture_map):
     return df_feat
 
 # -----------------------------------------------------------------------------
-# 3. REALISTIC MILP SOLVER (STARTING XI & CAPTAIN WEIGHTED)
+# 3. REALISTIC MILP SOLVER
 # -----------------------------------------------------------------------------
 def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=False):
     current_ids = [int(x) for x in current_ids]
@@ -160,55 +164,44 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
 
     prob = pulp.LpProblem("FPL_Realistic_Optimization", pulp.LpMaximize)
 
-    # Variabel Keputusan
     squad_vars = pulp.LpVariable.dicts("Squad", all_pids, cat='Binary')
     start_vars = pulp.LpVariable.dicts("Start", all_pids, cat='Binary')
     cap_vars = pulp.LpVariable.dicts("Cap", all_pids, cat='Binary')
     retain_vars = pulp.LpVariable.dicts("Retain", current_ids, cat='Binary')
 
-    # 1. Batasan Jumlah Skuad & Starting XI
     prob += pulp.lpSum([squad_vars[i] for i in all_pids]) == 15
     prob += pulp.lpSum([start_vars[i] for i in all_pids]) == 11
     prob += pulp.lpSum([cap_vars[i] for i in all_pids]) == 1
 
-    # 2. Hirarki: Starting XI harus bagian dari Squad, Captain harus bagian dari Starting XI
     for i in all_pids:
         prob += start_vars[i] <= squad_vars[i]
         prob += cap_vars[i] <= start_vars[i]
 
-    # 3. Batasan Budget Skuad Total
     prob += pulp.lpSum([(players.loc[players['id'] == i, 'now_cost'].values[0] / 10.0) * squad_vars[i] for i in all_pids]) <= total_budget
 
-    # 4. Formasi Sah Starting XI
-    # GKP: Tepat 1 di Starting XI, 2 di Squad Total
     gkp_ids = players[players['element_type'] == 1]['id'].tolist()
     prob += pulp.lpSum([start_vars[i] for i in gkp_ids]) == 1
     prob += pulp.lpSum([squad_vars[i] for i in gkp_ids]) == 2
 
-    # DEF: 3 s/d 5 di Starting XI, 5 di Squad Total
     def_ids = players[players['element_type'] == 2]['id'].tolist()
     prob += pulp.lpSum([start_vars[i] for i in def_ids]) >= 3
     prob += pulp.lpSum([start_vars[i] for i in def_ids]) <= 5
     prob += pulp.lpSum([squad_vars[i] for i in def_ids]) == 5
 
-    # MID: 2 s/d 5 di Starting XI, 5 di Squad Total
     mid_ids = players[players['element_type'] == 3]['id'].tolist()
     prob += pulp.lpSum([start_vars[i] for i in mid_ids]) >= 2
     prob += pulp.lpSum([start_vars[i] for i in mid_ids]) <= 5
     prob += pulp.lpSum([squad_vars[i] for i in mid_ids]) == 5
 
-    # FWD: 1 s/d 3 di Starting XI, 3 di Squad Total
     fwd_ids = players[players['element_type'] == 4]['id'].tolist()
     prob += pulp.lpSum([start_vars[i] for i in fwd_ids]) >= 1
     prob += pulp.lpSum([start_vars[i] for i in fwd_ids]) <= 3
     prob += pulp.lpSum([squad_vars[i] for i in fwd_ids]) == 3
 
-    # 5. Batasan Maksimal 3 Pemain Per Klub
     for team_id in players['team'].unique():
         team_pids = players[players['team'] == team_id]['id'].tolist()
         prob += pulp.lpSum([squad_vars[i] for i in team_pids]) <= 3
 
-    # 6. Hubungan Transfer & Retain
     for i in current_ids:
         prob += retain_vars[i] <= squad_vars[i]
 
@@ -216,12 +209,9 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     extra_transfers = pulp.LpVariable("ExtraTransfers", lowBound=0, cat='Integer')
     prob += extra_transfers >= transfers_made - free_transfers
 
-    # BATASAN KHUSUS TANPA WILDCARD: Batasi maksimal transfer ekstra (max 2 ekstra = max 3 transfer total)
     if not use_chip_wildcard:
         prob += extra_transfers <= 2
 
-    # 7. OBJECTIVE FUNCTION YANG REALISTIS:
-    # Starting XI xP (100%) + Captain Bonus xP (+100%) + Bench xP (HANYA 10%) - Hit Penalty (-4 pt per extra)
     hit_penalty_cost = 0.0 if use_chip_wildcard else 4.0
 
     starting_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * start_vars[i] for i in all_pids])
@@ -247,8 +237,8 @@ fpl_id = st.sidebar.text_input("Entry ID FPL:", value="", placeholder="Contoh: 1
 if "user_ids" not in st.session_state: st.session_state["user_ids"] = []
 if "bank" not in st.session_state: st.session_state["bank"] = 0.5
 
-bootstrap = fetch_fpl_bootstrap()
-fixture_map, next_gw_id = fetch_next_fixtures()
+bootstrap = fetch_fpl_bootstrap_v2()
+fixture_map, next_gw_id = fetch_next_fixtures_v2()
 
 if bootstrap:
     elements = pd.DataFrame(bootstrap["elements"])
@@ -258,10 +248,8 @@ if bootstrap:
     elements["team_name"] = elements["team"].map(teams)
     elements["display_name"] = elements["web_name"] + " (" + elements["team_name"] + ") - #" + elements["id"].astype(str)
     
-    elements = predict_player_xp(elements, teams_df, fixture_map)
-    
-    elements["opponent_name"] = elements["opponent_team_id"].map(teams)
-    elements["matchup_info"] = np.where(elements["is_home"] == 1, "vs " + elements["opponent_name"] + " (H)", "vs " + elements["opponent_name"] + " (A)")
+    # Run ML Prediction
+    elements = predict_player_xp_v2(elements, teams_df, fixture_map)
     
     if st.sidebar.button("Import Skuad FPL") and fpl_id:
         u_data, msg = fetch_user_fpl(fpl_id)
@@ -294,8 +282,12 @@ if bootstrap:
     current_df = elements[elements["display_name"].isin(selected_labels)].copy()
 
     if not current_df.empty:
+        # Tampilan Tabel yang Aman dari KeyError
+        display_cols = ["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "predicted_xP"]
+        safe_cols = [c for c in display_cols if c in current_df.columns]
+        
         st.dataframe(
-            current_df[["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0),
+            current_df[safe_cols].assign(Harga=lambda x: x["now_cost"]/10.0 if "now_cost" in x else 0),
             use_container_width=True
         )
 
@@ -333,20 +325,23 @@ if bootstrap:
                 if use_wildcard:
                     st.info("💡 **Status Chip:** WILDCARD / FREE HIT AKTIF (0 Penalti Hit untuk seluruh transfer).")
                 else:
-                    st.info("💡 **Status Chip:** Transfer Normal (Maksimal penalti hit dibatasi agar tetap rasional).")
+                    st.info("💡 **Status Chip:** Transfer Normal.")
 
                 if num_transfers == 0:
                     st.success("✅ **0 TRANSFER**. Skuad eksisting Anda sudah berada pada posisi poin paling maksimal.")
                 else:
                     st.success(f"✅ Disarankan melakukan **{num_transfers} Transfer** (Penalti Hit: -{hit_cost} Pts):")
                     
+                    out_show_cols = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP"] if c in t_out_df.columns]
+                    in_show_cols = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP"] if c in t_in_df.columns]
+                    
                     col_t1, col_t2 = st.columns(2)
                     with col_t1:
                         st.markdown("🔴 **Transfer Out (Pemain Keluar):**")
-                        st.dataframe(t_out_df[["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
+                        st.dataframe(t_out_df[out_show_cols].assign(Harga=lambda x: x["now_cost"]/10.0 if "now_cost" in x else 0), use_container_width=True)
                     with col_t2:
                         st.markdown("🟢 **Transfer In (Pemain Masuk):**")
-                        st.dataframe(t_in_df[["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
+                        st.dataframe(t_in_df[in_show_cols].assign(Harga=lambda x: x["now_cost"]/10.0 if "now_cost" in x else 0), use_container_width=True)
 
                 # -------------------------------------------------------------
                 # OUTPUT 2: STARTING LINEUP & KAPTEN
@@ -354,7 +349,6 @@ if bootstrap:
                 st.subheader("2. 🏆 Starting Lineup & Pemilihan Kapten")
                 captain = elements[elements['id'] == captain_id].iloc[0]
                 
-                # Vice Captain = Pemain Starting XI dengan xP tertinggi kedua di luar Kapten
                 vc_candidates = starting_xi[starting_xi['id'] != captain_id]
                 vice_captain = vc_candidates.iloc[0] if not vc_candidates.empty else captain
                 
@@ -370,16 +364,16 @@ if bootstrap:
 
                 st.markdown("---")
                 st.markdown("### 🟢 Starting Eleven (11 Pemain Utama)")
+                s11_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP"] if c in starting_xi.columns]
                 st.dataframe(
-                    starting_xi[["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP"]]
-                    .rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
+                    starting_xi[s11_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
                     use_container_width=True
                 )
 
                 st.markdown("### 🪑 Bench (4 Pemain Cadangan)")
+                bench_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP"] if c in bench.columns]
                 st.dataframe(
-                    bench[["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP"]]
-                    .rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
+                    bench[bench_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
                     use_container_width=True
                 )
 else:
