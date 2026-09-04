@@ -41,7 +41,18 @@ def fetch_user_fpl(entry_id):
     return {"player_ids": player_ids, "bank": bank}, "Data skuad berhasil diimpor!"
 
 # -----------------------------------------------------------------------------
-# 2. ADVANCED ML ENGINE (INCORPORATING OPPONENT DEFENSE & GK METRICS)
+# HELPER FUNCTION (HARUS DI LUAR SUPAYA CACHING STREAMLIT TIDAK ERROR)
+# -----------------------------------------------------------------------------
+def get_player_role(row):
+    roles = []
+    if row.get('penalties_order') == 1: roles.append("⚽ Penalty")
+    if row.get('corners_and_indirect_freekicks_order') == 1: roles.append("🚩 Corner")
+    if row.get('direct_freekicks_order') == 1: roles.append("🎯 Free-Kick")
+    if row.get('element_type') == 2 and (row.get('creativity', 0) > 80 or row.get('threat', 0) > 50): roles.append("🏃 Attacking WB")
+    return ", ".join(roles) if roles else "-"
+
+# -----------------------------------------------------------------------------
+# 2. ADVANCED ML ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def predict_player_xp(df, teams_df):
@@ -65,30 +76,22 @@ def predict_player_xp(df, teams_df):
         1.0, 0.0
     )
 
-    # -------------------------------------------------------------------------
-    # FITUR BARU: METRIK KESOLIDAN PERTAHANAN & KIPER TIM (OPPONENT DEFENSE)
-    # -------------------------------------------------------------------------
-    # Hitung metrik pertahanan per tim (Defense Weakness & GK Form)
+    # Opponent Defense Strength
     team_defense_stats = {}
     for team_id in teams_df['id']:
         team_players = df_feat[df_feat['team'] == team_id]
         
-        # Performa Kiper Utama Tim
         gk_players = team_players[team_players['element_type'] == 1].sort_values(by="form", ascending=False)
         gk_form = gk_players.iloc[0]['form'] if not gk_players.empty else 2.5
         
-        # Kesolidan Pertahanan Tim (Diukur dari rata-rata poin & form pemain bertahan mereka)
         def_players = team_players[team_players['element_type'] == 2]
         avg_def_form = def_players['form'].mean() if not def_players.empty else 2.0
         
-        # Defense Strength Score (Makin tinggi makin solid pertahanannya)
         defense_strength = (gk_form * 0.4) + (avg_def_form * 0.6)
         team_defense_stats[team_id] = round(defense_strength, 2)
 
-    # Petakan Opponent Defense Rating ke Pemain (Sederhana berdasarkan rata-rata liga)
-    avg_league_def = np.mean(list(team_defense_stats.values()))
+    avg_league_def = np.mean(list(team_defense_stats.values())) if team_defense_stats else 2.0
     
-    # Penyesuaian Matchup
     df_feat['opp_defense_factor'] = df_feat['team'].map(
         lambda t_id: round(avg_league_def / max(0.1, team_defense_stats.get(t_id, avg_league_def)), 2)
     )
@@ -102,7 +105,6 @@ def predict_player_xp(df, teams_df):
     ]
     X = df_feat[feature_cols]
     
-    # Target Sintesis Berbobot Statistik Detail + Multiplier Opponent Matchup
     y_target = (
         df_feat['form'] * 0.20 + 
         df_feat['ict_index'] * 0.05 + 
@@ -117,19 +119,10 @@ def predict_player_xp(df, teams_df):
     rf = RandomForestRegressor(n_estimators=60, max_depth=6, random_state=42)
     rf.fit(X, y_target)
     
-    df['predicted_xP'] = np.round(rf.predict(X), 2)
+    df_feat['predicted_xP'] = np.round(rf.predict(X), 2)
+    df_feat['special_roles'] = df_feat.apply(get_player_role, axis=1)
     
-    # Tagging Peran Pemain untuk Ditampilkan di UI
-    def get_player_role(row):
-        roles = []
-        if row['penalties_order'] == 1: roles.append("⚽ Penalty")
-        if row['corners_and_indirect_freekicks_order'] == 1: roles.append("🚩 Corner")
-        if row['direct_freekicks_order'] == 1: roles.append("🎯 Free-Kick")
-        if row['element_type'] == 2 and (row['creativity'] > 80 or row['threat'] > 50): roles.append("🏃 Attacking WB")
-        return ", ".join(roles) if roles else "-"
-
-    df['special_roles'] = df.apply(get_player_role, axis=1)
-    return df
+    return df_feat
 
 # -----------------------------------------------------------------------------
 # 3. GENETIC ALGORITHM OPTIMIZER
@@ -258,7 +251,6 @@ if bootstrap:
     teams = {t["id"]: t["name"] for t in bootstrap["teams"]}
     elements["team_name"] = elements["team"].map(teams)
     
-    # Jalankan ML Prediksi dengan Fitur Opponent Defense & GK Matchup
     elements = predict_player_xp(elements, teams_df)
     
     if st.sidebar.button("Import Skuad FPL") and fpl_id:
