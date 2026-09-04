@@ -90,15 +90,21 @@ def get_player_role(row):
     return ", ".join(roles) if roles else "-"
 
 # -----------------------------------------------------------------------------
-# 3. MACHINE LEARNING ENGINE
+# 3. MACHINE LEARNING ENGINE (INCORPORATING INJURY / PLAYING PROBABILITY)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def predict_player_xp(df, teams_df, fixture_map):
     df_feat = df.copy()
     
-    # Hitung Harga dalam Juta Pounds (£m) langsung
     df_feat['Harga'] = np.round(df_feat['now_cost'] / 10.0, 1)
     
+    # Preprocessing Probabilitas Bermain (0% s/d 100%)
+    df_feat['play_chance_raw'] = pd.to_numeric(df_feat['chance_of_playing_next_round'], errors='coerce').fillna(100)
+    df_feat['play_chance_factor'] = df_feat['play_chance_raw'] / 100.0
+    
+    # Jika peluang main <= 25%, paksa multiplier = 0.0 mutlak
+    df_feat['play_chance_factor'] = np.where(df_feat['play_chance_raw'] <= 25, 0.0, df_feat['play_chance_factor'])
+
     for col in ['form', 'ict_index', 'creativity', 'threat', 'points_per_game', 'selected_by_percent', 'ep_next']:
         df_feat[col] = pd.to_numeric(df_feat[col], errors='coerce').fillna(0)
     
@@ -143,6 +149,7 @@ def predict_player_xp(df, teams_df, fixture_map):
     ]
     X = df_feat[feature_cols]
     
+    # Target Sintesis dikalikan secara langsung dengan play_chance_factor
     y_target = (
         df_feat['form'] * 0.20 + 
         df_feat['ict_index'] * 0.05 + 
@@ -152,7 +159,7 @@ def predict_player_xp(df, teams_df, fixture_map):
         df_feat['is_corner_taker'] * 1.0 + 
         df_feat['is_fk_taker'] * 0.5 + 
         df_feat['is_attacking_defender'] * 1.2
-    ) * df_feat['opp_defense_factor'] * df_feat['fdr_multiplier'] * np.where(df_feat['is_home'] == 1, 1.10, 0.95) * np.where(df_feat['status'] == 'a', 1.0, 0.15)
+    ) * df_feat['opp_defense_factor'] * df_feat['fdr_multiplier'] * np.where(df_feat['is_home'] == 1, 1.10, 0.95) * df_feat['play_chance_factor']
     
     rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
     rf.fit(X, y_target)
@@ -163,7 +170,7 @@ def predict_player_xp(df, teams_df, fixture_map):
     return df_feat
 
 # -----------------------------------------------------------------------------
-# 4. REALISTIC MILP SOLVER
+# 4. REALISTIC MILP SOLVER (WITH INJURY RETENTION PENALTY)
 # -----------------------------------------------------------------------------
 def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=False):
     current_ids = [int(x) for x in current_ids]
@@ -182,6 +189,7 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     cap_vars = pulp.LpVariable.dicts("Cap", all_pids, cat='Binary')
     retain_vars = pulp.LpVariable.dicts("Retain", current_ids, cat='Binary')
 
+    # 1. Ukuran Skuad & Formasi
     prob += pulp.lpSum([squad_vars[i] for i in all_pids]) == 15
     prob += pulp.lpSum([start_vars[i] for i in all_pids]) == 11
     prob += pulp.lpSum([cap_vars[i] for i in all_pids]) == 1
@@ -190,8 +198,10 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
         prob += start_vars[i] <= squad_vars[i]
         prob += cap_vars[i] <= start_vars[i]
 
+    # 2. Budget Constraint
     prob += pulp.lpSum([(players.loc[players['id'] == i, 'now_cost'].values[0] / 10.0) * squad_vars[i] for i in all_pids]) <= total_budget
 
+    # 3. Kuota Posisi Sah FPL
     gkp_ids = players[players['element_type'] == 1]['id'].tolist()
     prob += pulp.lpSum([start_vars[i] for i in gkp_ids]) == 1
     prob += pulp.lpSum([squad_vars[i] for i in gkp_ids]) == 2
@@ -211,10 +221,12 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     prob += pulp.lpSum([start_vars[i] for i in fwd_ids]) <= 3
     prob += pulp.lpSum([squad_vars[i] for i in fwd_ids]) == 3
 
+    # 4. Batasan Maksimal 3 Pemain Per Klub
     for team_id in players['team'].unique():
         team_pids = players[players['team'] == team_id]['id'].tolist()
         prob += pulp.lpSum([squad_vars[i] for i in team_pids]) <= 3
 
+    # 5. Batasan Transfer & Penalti Hit
     for i in current_ids:
         prob += retain_vars[i] <= squad_vars[i]
 
@@ -227,11 +239,18 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
 
     hit_penalty_cost = 0.0 if use_chip_wildcard else 4.0
 
+    # 6. PENALTI RETENSI PEMAIN CEDERA/BERISIKO TINGGI (FORCED SELL)
+    # Jika mempertahankan pemain yang play_chance < 75%, berikan penalti berat (15 pt per pemain)
+    injury_penalty = pulp.lpSum([
+        15.0 * retain_vars[i] for i in current_ids 
+        if players.loc[players['id'] == i, 'play_chance_raw'].values[0] < 75
+    ])
+
     starting_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * start_vars[i] for i in all_pids])
     captain_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * cap_vars[i] for i in all_pids])
     bench_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * (squad_vars[i] - start_vars[i]) for i in all_pids])
 
-    prob += starting_xp + captain_xp + (0.10 * bench_xp) - (hit_penalty_cost * extra_transfers)
+    prob += starting_xp + captain_xp + (0.10 * bench_xp) - (hit_penalty_cost * extra_transfers) - injury_penalty
 
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
@@ -294,10 +313,10 @@ if bootstrap:
     current_df = elements[elements["display_name"].isin(selected_labels)].copy()
 
     if not current_df.empty:
-        display_cols = ["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "predicted_xP", "Harga"]
+        display_cols = ["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "play_chance_raw", "predicted_xP", "Harga"]
         safe_cols = [c for c in display_cols if c in current_df.columns]
         
-        st.dataframe(current_df[safe_cols], use_container_width=True)
+        st.dataframe(current_df[safe_cols].rename(columns={"play_chance_raw": "Peluang Main (%)"}), use_container_width=True)
 
         if st.button("🚀 JALANKAN OPTIMASI REALISTIS"):
             current_ids = [int(x) for x in current_df["id"].tolist()]
@@ -340,15 +359,15 @@ if bootstrap:
                 else:
                     st.success(f"✅ Disarankan melakukan **{num_transfers} Transfer** (Penalti Hit: -{hit_cost} Pts):")
                     
-                    show_cols_t = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP", "Harga"] if c in elements.columns]
+                    show_cols_t = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "play_chance_raw", "predicted_xP", "Harga"] if c in elements.columns]
                     
                     col_t1, col_t2 = st.columns(2)
                     with col_t1:
                         st.markdown("🔴 **Transfer Out (Pemain Keluar):**")
-                        st.dataframe(t_out_df[show_cols_t], use_container_width=True)
+                        st.dataframe(t_out_df[show_cols_t].rename(columns={"play_chance_raw": "Peluang Main (%)"}), use_container_width=True)
                     with col_t2:
                         st.markdown("🟢 **Transfer In (Pemain Masuk):**")
-                        st.dataframe(t_in_df[show_cols_t], use_container_width=True)
+                        st.dataframe(t_in_df[show_cols_t].rename(columns={"play_chance_raw": "Peluang Main (%)"}), use_container_width=True)
 
                 # -------------------------------------------------------------
                 # OUTPUT 2: STARTING LINEUP & KAPTEN
@@ -371,16 +390,16 @@ if bootstrap:
 
                 st.markdown("---")
                 st.markdown("### 🟢 Starting Eleven (11 Pemain Utama)")
-                s11_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP", "Harga"] if c in starting_xi.columns]
+                s11_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "play_chance_raw", "predicted_xP", "Harga"] if c in starting_xi.columns]
                 st.dataframe(
-                    starting_xi[s11_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
+                    starting_xi[s11_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus", "play_chance_raw": "Peluang Main (%)"}), 
                     use_container_width=True
                 )
 
                 st.markdown("### 🪑 Bench (4 Pemain Cadangan)")
-                bench_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP", "Harga"] if c in bench.columns]
+                bench_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "play_chance_raw", "predicted_xP", "Harga"] if c in bench.columns]
                 st.dataframe(
-                    bench[bench_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
+                    bench[bench_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus", "play_chance_raw": "Peluang Main (%)"}), 
                     use_container_width=True
                 )
 else:
