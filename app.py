@@ -13,18 +13,24 @@ st.title("⚡ FPL Ultra Optimizer: Fixtures, Matchup & MILP")
 # 1. FETCH DATA & FIXTURES FROM FPL API
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def fetch_fpl_bootstrap_v2():
+def fetch_fpl_bootstrap_v3():
     url = "https://fantasy.premierleague.com/api/bootstrap-static/"
     res = requests.get(url)
     return res.json() if res.status_code == 200 else None
 
 @st.cache_data(ttl=3600)
-def fetch_next_fixtures_v2():
-    bootstrap = fetch_fpl_bootstrap_v2()
+def fetch_next_fixtures_v3():
+    bootstrap = fetch_fpl_bootstrap_v3()
     if not bootstrap: 
         return {}, None
     
-    next_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_next'] or gw['is_current']][0]
+    # Target 'is_next' specifically for upcoming gameweek target (GW3)
+    next_gw_list = [gw['id'] for gw in bootstrap['events'] if gw['is_next']]
+    if next_gw_list:
+        next_gw = next_gw_list[0]
+    else:
+        next_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_current']][0]
+        
     url = f"https://fantasy.premierleague.com/api/fixtures/?event={next_gw}"
     res = requests.get(url)
     if res.status_code != 200: 
@@ -45,11 +51,13 @@ def fetch_next_fixtures_v2():
     return fixture_map, next_gw
 
 def fetch_user_fpl(entry_id):
-    bootstrap = fetch_fpl_bootstrap_v2()
+    bootstrap = fetch_fpl_bootstrap_v3()
     if not bootstrap:
         return None, "Gagal terhubung ke API FPL."
     
-    current_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_current'] or gw['is_next']][0]
+    # Fetch existing squad picks from current active/past gameweek
+    curr_gw_list = [gw['id'] for gw in bootstrap['events'] if gw['is_current']]
+    current_gw = curr_gw_list[0] if curr_gw_list else 1
     
     picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw}/picks/"
     res = requests.get(picks_url)
@@ -78,7 +86,7 @@ def get_player_role(row):
 # 2. MACHINE LEARNING ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def predict_player_xp_v2(df, teams_df, fixture_map):
+def predict_player_xp_v3(df, teams_df, fixture_map):
     df_feat = df.copy()
     
     df_feat['form'] = pd.to_numeric(df_feat['form'], errors='coerce').fillna(0)
@@ -237,8 +245,8 @@ fpl_id = st.sidebar.text_input("Entry ID FPL:", value="", placeholder="Contoh: 1
 if "user_ids" not in st.session_state: st.session_state["user_ids"] = []
 if "bank" not in st.session_state: st.session_state["bank"] = 0.5
 
-bootstrap = fetch_fpl_bootstrap_v2()
-fixture_map, next_gw_id = fetch_next_fixtures_v2()
+bootstrap = fetch_fpl_bootstrap_v3()
+fixture_map, next_gw_id = fetch_next_fixtures_v3()
 
 if bootstrap:
     elements = pd.DataFrame(bootstrap["elements"])
@@ -249,7 +257,7 @@ if bootstrap:
     elements["display_name"] = elements["web_name"] + " (" + elements["team_name"] + ") - #" + elements["id"].astype(str)
     
     # Run ML Prediction
-    elements = predict_player_xp_v2(elements, teams_df, fixture_map)
+    elements = predict_player_xp_v3(elements, teams_df, fixture_map)
     
     if st.sidebar.button("Import Skuad FPL") and fpl_id:
         u_data, msg = fetch_user_fpl(fpl_id)
@@ -282,7 +290,6 @@ if bootstrap:
     current_df = elements[elements["display_name"].isin(selected_labels)].copy()
 
     if not current_df.empty:
-        # Tampilan Tabel yang Aman dari KeyError
         display_cols = ["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "predicted_xP"]
         safe_cols = [c for c in display_cols if c in current_df.columns]
         
