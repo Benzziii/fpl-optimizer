@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import random
+import pulp
 from sklearn.ensemble import RandomForestRegressor
 
 # Config Halaman
-st.set_page_config(page_title="FPL Genetic Algorithm Optimizer", layout="wide")
-st.title("⚽ FPL Pure Genetic Algorithm & ML Optimizer")
+st.set_page_config(page_title="FPL Fast MILP Optimizer", layout="wide")
+st.title("⚡ FPL Ultra-Fast Optimizer (MILP + Machine Learning)")
 
 # -----------------------------------------------------------------------------
 # 1. FETCH DATA FROM FPL API
@@ -43,6 +43,7 @@ def fetch_user_fpl(entry_id):
 # -----------------------------------------------------------------------------
 # 2. MACHINE LEARNING ENGINE (PREDICT XP VIA RANDOM FOREST)
 # -----------------------------------------------------------------------------
+@st.cache_data(ttl=3600)
 def predict_player_xp(df):
     df_feat = df.copy()
     
@@ -68,112 +69,64 @@ def predict_player_xp(df):
     return df
 
 # -----------------------------------------------------------------------------
-# 3. GENETIC ALGORITHM OPTIMIZER (DYNAMIC TRANSFERS & SQUAD SELECTION)
+# 3. MILP OPTIMIZER ENGINE (PULP)
 # -----------------------------------------------------------------------------
-def run_genetic_algorithm(df, current_ids, bank, free_transfers, pop_size=80, generations=50):
-    all_ids = df['id'].tolist()
-    id_to_price = dict(zip(df['id'], df['now_cost'] / 10.0))
-    id_to_xp = dict(zip(df['id'], df['predicted_xP']))
-    id_to_pos = dict(zip(df['id'], df['element_type'])) # 1: GKP, 2: DEF, 3: MID, 4: FWD
-    id_to_team = dict(zip(df['id'], df['team']))
-
-    current_cost = sum(id_to_price[i] for i in current_ids)
-    max_budget = current_cost + bank
-
-    # Fungsi Cek Validitas Skuad FPL (15 Pemain)
-    def is_valid_squad(squad_ids):
-        if len(squad_ids) != 15: return False
+def solve_fpl_milp(df, current_ids, bank, free_transfers):
+    players = df.copy()
+    player_ids = players['id'].tolist()
+    
+    # Menghitung budget total yang diizinkan
+    current_cost = (players[players['id'].isin(current_ids)]['now_cost'] / 10.0).sum()
+    budget = current_cost + bank
+    
+    # Inisialisasi Problem MILP
+    prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
+    
+    # Variabel Keputusan (1 jika dipilih masuk skuad 15 pemain, 0 jika tidak)
+    squad_vars = pulp.LpVariable.dicts("Squad", player_ids, cat='Binary')
+    
+    # Variabel Keputusan (1 jika pemain di-retain dari skuad lama)
+    retain_vars = pulp.LpVariable.dicts("Retain", current_ids, cat='Binary')
+    
+    # 1. Batasan Jumlah Skuad = 15 Pemain
+    prob += pulp.lpSum([squad_vars[i] for i in player_ids]) == 15
+    
+    # 2. Batasan Budget
+    prob += pulp.lpSum([(players.loc[players['id'] == i, 'now_cost'].values[0] / 10.0) * squad_vars[i] for i in player_ids]) <= budget
+    
+    # 3. Batasan Posisi Skuad (2 GKP, 5 DEF, 5 MID, 3 FWD)
+    for pos_code, count in [(1, 2), (2, 5), (3, 5), (4, 3)]:
+        pos_ids = players[players['element_type'] == pos_code]['id'].tolist()
+        prob += pulp.lpSum([squad_vars[i] for i in pos_ids]) == count
         
-        # 1. Budget Constraint
-        if sum(id_to_price[i] for i in squad_ids) > max_budget: return False
+    # 4. Batasan Maksimal 3 Pemain Per Klub
+    for team_id in players['team'].unique():
+        team_pids = players[players['team'] == team_id]['id'].tolist()
+        prob += pulp.lpSum([squad_vars[i] for i in team_pids]) <= 3
         
-        # 2. Position Constraint (2 GKP, 5 DEF, 5 MID, 3 FWD)
-        pos_counts = {1:0, 2:0, 3:0, 4:0}
-        for i in squad_ids:
-            pos_counts[id_to_pos[i]] += 1
-        if pos_counts != {1:2, 2:5, 3:5, 4:3}: return False
+    # 5. Hubungan Retain dengan Squad
+    for i in current_ids:
+        prob += retain_vars[i] <= squad_vars[i]
         
-        # 3. Max 3 Players per Team
-        team_counts = {}
-        for i in squad_ids:
-            t = id_to_team[i]
-            team_counts[t] = team_counts.get(t, 0) + 1
-            if team_counts[t] > 3: return False
-            
-        return True
+    # Hitung Jumlah Transfer
+    transfers_made = 15 - pulp.lpSum([retain_vars[i] for i in current_ids])
+    
+    # Objective Function: Memaksimalkan Total xP Dikurangi Penalti Hit Transfer (-4 pt per ekstra transfer)
+    total_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * squad_vars[i] for i in player_ids])
+    
+    # Pendekatan Linear untuk Penalti Hit
+    prob += total_xp - (4.0 * (15 - pulp.lpSum([retain_vars[i] for i in current_ids]) - free_transfers))
 
-    # Fitness Function (Total xP dikurangi Penalti Hit Transfer -4 pt per Extra Transfer)
-    def calculate_fitness(squad_ids):
-        transfers_made = len(set(squad_ids) - set(current_ids))
-        extra_transfers = max(0, transfers_made - free_transfers)
-        hit_penalty = extra_transfers * 4.0
-        
-        total_xp = sum(id_to_xp[i] for i in squad_ids)
-        return total_xp - hit_penalty
-
-    # --- INISIALISASI POPULASI ---
-    population = []
-    if is_valid_squad(current_ids):
-        population.append(current_ids)
-
-    # Generate Variasi Skuad Awal (Termasuk 0, 1, 2, 3+ Transfer)
-    attempts = 0
-    while len(population) < pop_size and attempts < 2000:
-        attempts += 1
-        num_swaps = random.randint(0, 4) # Menguji variasi 0 hingga 4 transfer
-        candidate = list(current_ids)
-        
-        for _ in range(num_swaps):
-            if candidate:
-                idx_remove = random.randint(0, len(candidate) - 1)
-                candidate.pop(idx_remove)
-                
-            new_pick = random.choice(all_ids)
-            if new_pick not in candidate:
-                candidate.append(new_pick)
-                
-        if is_valid_squad(candidate):
-            population.append(candidate)
-
-    if not population:
-        population = [current_ids]
-
-    # --- EVOLUSI (GENETIC ALGORITHM ITERATION) ---
-    for _ in range(generations):
-        population = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)
-        survivors = population[:pop_size // 2]
-        
-        children = []
-        while len(survivors) + len(children) < pop_size:
-            p1, p2 = random.sample(survivors, 2)
-            
-            # Crossover (Pindah Silang)
-            split = random.randint(1, 14)
-            child = list(set(p1[:split] + p2[split:]))
-            
-            # Perbaiki jika panjang gen berkurang akibat deduplikasi set
-            missing = [i for i in all_ids if i not in child]
-            random.shuffle(missing)
-            while len(child) < 15 and missing:
-                child.append(missing.pop())
-                
-            # Mutasi
-            if random.random() < 0.35:
-                m_idx = random.randint(0, 14)
-                rand_p = random.choice(all_ids)
-                if rand_p not in child:
-                    child[m_idx] = rand_p
-                    
-            if is_valid_squad(child):
-                children.append(child)
-                
-        population = survivors + children
-
-    best_squad = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)[0]
-    return best_squad
+    # Solve Optimization Problem
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    
+    # Ambil Skuad Terpilih
+    selected_squad_ids = [i for i in player_ids if squad_vars[i].varValue == 1]
+    
+    return selected_squad_ids
 
 def select_starting_xi(squad_df):
-    """Memilih 11 Pemain Utama dengan Formasi Valid FPL (1 GKP, Min 3 DEF, Min 2 MID, Min 1 FWD)"""
+    """Memilih 11 Pemain Utama & Formasi Valid FPL"""
     gkps = squad_df[squad_df['element_type'] == 1].sort_values(by="predicted_xP", ascending=False)
     defs = squad_df[squad_df['element_type'] == 2].sort_values(by="predicted_xP", ascending=False)
     mids = squad_df[squad_df['element_type'] == 3].sort_values(by="predicted_xP", ascending=False)
@@ -241,17 +194,17 @@ if bootstrap:
             use_container_width=True
         )
 
-        if st.button("🧬 JALANKAN OPTIMASI GENETIC ALGORITHM & ML"):
+        if st.button("🚀 JALANKAN OPTIMASI MILP & ML (SUPER FAST)"):
             current_ids = current_df["id"].tolist()
             
-            with st.spinner("Genetic Algorithm sedang mensimulasikan evolusi kombinasi transfer & menentukan jumlah transfer paling optimal..."):
-                best_squad_ids = run_genetic_algorithm(elements, current_ids, bank_money, free_transfers)
+            with st.spinner("Memproses Optimasi Matematika MILP..."):
+                best_squad_ids = solve_fpl_milp(elements, current_ids, bank_money, free_transfers)
                 final_squad_df = elements[elements['id'].isin(best_squad_ids)].copy()
                 starting_xi, bench = select_starting_xi(final_squad_df)
                 
             st.divider()
 
-            # --- IDENTIFIKASI PERUBAHAN TRANSFER DARI GA ---
+            # --- IDENTIFIKASI PERUBAHAN TRANSFER DARI MILP ---
             transfers_out_ids = list(set(current_ids) - set(best_squad_ids))
             transfers_in_ids = list(set(best_squad_ids) - set(current_ids))
             
@@ -259,9 +212,9 @@ if bootstrap:
             t_in_df = elements[elements['id'].isin(transfers_in_ids)]
 
             # -----------------------------------------------------------------
-            # OUTPUT 1: REKOMENDASI TRANSFER (GA) & CHIP
+            # OUTPUT 1: REKOMENDASI TRANSFER (MILP) & CHIP
             # -----------------------------------------------------------------
-            st.subheader("1. 🔄 Hasil Rekomendasi Transfer (Optimasi Genetic Algorithm)")
+            st.subheader("1. 🔄 Hasil Rekomendasi Transfer Optimal")
             
             num_transfers = len(transfers_in_ids)
             extra_transfers = max(0, num_transfers - free_transfers)
@@ -272,16 +225,16 @@ if bootstrap:
             chip_msg = "Saran Chip: Tidak perlu menggunakan Chip pekan ini."
             
             if num_transfers >= 4 and "Wildcard" in chips_available:
-                chip_msg = "⚠️ **Saran Chip:** Sangat disarankan mengaktifkan **WILDCARD**! Jumlah pergantian optimal dari GA terlalu banyak untuk transfer biasa."
+                chip_msg = "⚠️ **Saran Chip:** Sangat disarankan mengaktifkan **WILDCARD**! Kombinasi optimal memerlukan banyak transfer."
             elif injured_count >= 3 and "Free Hit" in chips_available:
-                chip_msg = "💡 **Saran Chip:** Pertimbangkan **FREE HIT** untuk menghindari pengurangan poin berlebih akibat pemain cedera."
+                chip_msg = "💡 **Saran Chip:** Pertimbangkan **FREE HIT** untuk menghindari pengurangan poin berlebih."
                 
             st.info(f"**Strategi Chip:** {chip_msg}")
 
             if num_transfers == 0:
-                st.success("✅ **Saran Transfer dari GA:** **TIDAK ADA TRANSFER (0 Transfer)**. Kombinasi tim eksisting Anda sudah merupakan titik puncak poin optimal pekan ini.")
+                st.success("✅ **Saran Transfer:** **0 TRANSFER**. Skuad eksisting Anda sudah berada pada posisi poin paling maksimal.")
             else:
-                st.success(f"✅ **Saran Transfer dari GA:** Genetic Algorithm menemukan bahwa **{num_transfers} Transfer** adalah opsi paling optimal (Penalti Hit: -{hit_cost} Pts).")
+                st.success(f"✅ **Saran Transfer:** Lakukan **{num_transfers} Transfer** berikut (Penalti Hit: -{hit_cost} Pts):")
                 
                 col_t1, col_t2 = st.columns(2)
                 with col_t1:
@@ -299,7 +252,6 @@ if bootstrap:
             captain = starting_xi.iloc[0]
             vice_captain = starting_xi.iloc[1]
             
-            # Net Expected Points = Total xP Starting XI + (2x xP Captain) - Hit Penalty Transfer
             raw_total_pts = starting_xi['predicted_xP'].sum() + captain['predicted_xP']
             net_expected_pts = raw_total_pts - hit_cost
             
@@ -309,7 +261,7 @@ if bootstrap:
             with col_cap2:
                 st.metric("🎖️ VICE-CAPTAIN", f"{vice_captain['web_name']}", f"{vice_captain['predicted_xP']} xP")
             with col_cap3:
-                st.metric("📊 NET PROYEKSI POIN (Setlah Hit)", f"{round(net_expected_pts, 2)} Pts")
+                st.metric("📊 NET PROYEKSI POIN", f"{round(net_expected_pts, 2)} Pts")
 
             st.markdown("---")
             st.markdown("### 🟢 Starting Eleven (11 Pemain Utama)")
