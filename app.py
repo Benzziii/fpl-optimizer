@@ -16,11 +16,9 @@ def get_next_gw_id(bootstrap):
     if not bootstrap or 'events' not in bootstrap:
         return 1
     events = bootstrap['events']
-    # Prioritaskan gw['is_next'] untuk Gameweek berikutnya (GW3)
     next_gws = [gw['id'] for gw in events if gw.get('is_next')]
     if next_gws:
         return next_gws[0]
-    # Fallback jika tidak ada is_next
     current_gws = [gw['id'] for gw in events if gw.get('is_current')]
     if current_gws:
         return current_gws[0]
@@ -68,7 +66,6 @@ def fetch_user_fpl(entry_id):
     
     target_gw = get_next_gw_id(bootstrap)
     
-    # Coba ambil picks untuk target GW, fallback ke GW sebelumnya jika belum rilis
     picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{target_gw}/picks/"
     res = requests.get(picks_url)
     if res.status_code != 200 and target_gw > 1:
@@ -98,6 +95,9 @@ def get_player_role(row):
 @st.cache_data(ttl=3600)
 def predict_player_xp(df, teams_df, fixture_map):
     df_feat = df.copy()
+    
+    # Hitung Harga dalam Juta Pounds (£m) langsung
+    df_feat['Harga'] = np.round(df_feat['now_cost'] / 10.0, 1)
     
     for col in ['form', 'ict_index', 'creativity', 'threat', 'points_per_game', 'selected_by_percent', 'ep_next']:
         df_feat[col] = pd.to_numeric(df_feat[col], errors='coerce').fillna(0)
@@ -294,13 +294,10 @@ if bootstrap:
     current_df = elements[elements["display_name"].isin(selected_labels)].copy()
 
     if not current_df.empty:
-        display_cols = ["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "predicted_xP"]
+        display_cols = ["web_name", "team_name", "matchup_info", "fdr", "special_roles", "status", "predicted_xP", "Harga"]
         safe_cols = [c for c in display_cols if c in current_df.columns]
         
-        st.dataframe(
-            current_df[safe_cols].assign(Harga=lambda x: x["now_cost"]/10.0 if "now_cost" in x else 0),
-            use_container_width=True
-        )
+        st.dataframe(current_df[safe_cols], use_container_width=True)
 
         if st.button("🚀 JALANKAN OPTIMASI REALISTIS"):
             current_ids = [int(x) for x in current_df["id"].tolist()]
@@ -343,16 +340,15 @@ if bootstrap:
                 else:
                     st.success(f"✅ Disarankan melakukan **{num_transfers} Transfer** (Penalti Hit: -{hit_cost} Pts):")
                     
-                    out_show_cols = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP"] if c in t_out_df.columns]
-                    in_show_cols = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP"] if c in t_in_df.columns]
+                    show_cols_t = [c for c in ["web_name", "team_name", "matchup_info", "special_roles", "predicted_xP", "Harga"] if c in elements.columns]
                     
                     col_t1, col_t2 = st.columns(2)
                     with col_t1:
                         st.markdown("🔴 **Transfer Out (Pemain Keluar):**")
-                        st.dataframe(t_out_df[out_show_cols].assign(Harga=lambda x: x["now_cost"]/10.0 if "now_cost" in x else 0), use_container_width=True)
+                        st.dataframe(t_out_df[show_cols_t], use_container_width=True)
                     with col_t2:
                         st.markdown("🟢 **Transfer In (Pemain Masuk):**")
-                        st.dataframe(t_in_df[in_show_cols].assign(Harga=lambda x: x["now_cost"]/10.0 if "now_cost" in x else 0), use_container_width=True)
+                        st.dataframe(t_in_df[show_cols_t], use_container_width=True)
 
                 # -------------------------------------------------------------
                 # OUTPUT 2: STARTING LINEUP & KAPTEN
@@ -375,14 +371,14 @@ if bootstrap:
 
                 st.markdown("---")
                 st.markdown("### 🟢 Starting Eleven (11 Pemain Utama)")
-                s11_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP"] if c in starting_xi.columns]
+                s11_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP", "Harga"] if c in starting_xi.columns]
                 st.dataframe(
                     starting_xi[s11_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
                     use_container_width=True
                 )
 
                 st.markdown("### 🪑 Bench (4 Pemain Cadangan)")
-                bench_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP"] if c in bench.columns]
+                bench_show = [c for c in ["web_name", "team_name", "matchup_info", "fdr", "element_type", "special_roles", "status", "predicted_xP", "Harga"] if c in bench.columns]
                 st.dataframe(
                     bench[bench_show].rename(columns={"matchup_info": "Lawan GW Ini", "fdr": "FDR", "special_roles": "Peran Khusus"}), 
                     use_container_width=True
