@@ -10,7 +10,24 @@ st.set_page_config(page_title="FPL Realistic MILP Optimizer", layout="wide")
 st.title("⚡ FPL Ultra Optimizer: Fixtures, Matchup & MILP")
 
 # -----------------------------------------------------------------------------
-# 1. FETCH DATA & FIXTURES FROM FPL API
+# 1. HELPER: STRICT NEXT GAMEWEEK RESOLVER
+# -----------------------------------------------------------------------------
+def get_next_gw_id(bootstrap):
+    if not bootstrap or 'events' not in bootstrap:
+        return 1
+    events = bootstrap['events']
+    # Prioritaskan gw['is_next'] untuk Gameweek berikutnya (GW3)
+    next_gws = [gw['id'] for gw in events if gw.get('is_next')]
+    if next_gws:
+        return next_gws[0]
+    # Fallback jika tidak ada is_next
+    current_gws = [gw['id'] for gw in events if gw.get('is_current')]
+    if current_gws:
+        return current_gws[0]
+    return 1
+
+# -----------------------------------------------------------------------------
+# 2. FETCH DATA & FIXTURES FROM FPL API
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_fpl_bootstrap():
@@ -22,9 +39,9 @@ def fetch_fpl_bootstrap():
 def fetch_next_fixtures():
     bootstrap = fetch_fpl_bootstrap()
     if not bootstrap: 
-        return {}, None
+        return {}, 1
     
-    next_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_next'] or gw['is_current']][0]
+    next_gw = get_next_gw_id(bootstrap)
     url = f"https://fantasy.premierleague.com/api/fixtures/?event={next_gw}"
     res = requests.get(url)
     if res.status_code != 200: 
@@ -49,12 +66,13 @@ def fetch_user_fpl(entry_id):
     if not bootstrap:
         return None, "Gagal terhubung ke API FPL."
     
-    current_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_current'] or gw['is_next']][0]
+    target_gw = get_next_gw_id(bootstrap)
     
-    picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw}/picks/"
+    # Coba ambil picks untuk target GW, fallback ke GW sebelumnya jika belum rilis
+    picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{target_gw}/picks/"
     res = requests.get(picks_url)
-    if res.status_code != 200 and current_gw > 1:
-        picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw - 1}/picks/"
+    if res.status_code != 200 and target_gw > 1:
+        picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{target_gw - 1}/picks/"
         res = requests.get(picks_url)
         
     if res.status_code != 200:
@@ -75,7 +93,7 @@ def get_player_role(row):
     return ", ".join(roles) if roles else "-"
 
 # -----------------------------------------------------------------------------
-# 2. MACHINE LEARNING ENGINE (PREDICT XP WITH CLAMPED FIXTURES & MATCHUPS)
+# 3. MACHINE LEARNING ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def predict_player_xp(df, teams_df, fixture_map):
@@ -100,7 +118,6 @@ def predict_player_xp(df, teams_df, fixture_map):
     df_feat['opponent_name'] = df_feat['opponent_team_id'].map(teams_dict).fillna("Unknown")
     df_feat['matchup_info'] = np.where(df_feat['is_home'] == 1, "vs " + df_feat['opponent_name'] + " (H)", "vs " + df_feat['opponent_name'] + " (A)")
 
-    # Perhitungan Performa Pertahanan Tim Lawan
     team_defense_stats = {}
     for team_id in teams_df['id']:
         team_players = df_feat[df_feat['team'] == team_id]
@@ -112,12 +129,10 @@ def predict_player_xp(df, teams_df, fixture_map):
 
     avg_league_def = np.mean(list(team_defense_stats.values())) if team_defense_stats else 2.0
     
-    # PERBAIKAN: opp_defense_factor dikunci (clamped) pada rentang 0.80 s/d 1.25 agar xP tidak membengkak
     raw_opp_factor = df_feat['opponent_team_id'].map(
         lambda opp_id: avg_league_def / max(1.0, team_defense_stats.get(opp_id, avg_league_def))
     )
     df_feat['opp_defense_factor'] = np.clip(raw_opp_factor, 0.80, 1.25)
-
     df_feat['fdr_multiplier'] = 1.0 - ((df_feat['fdr'] - 3) * 0.12)
 
     feature_cols = [
@@ -148,7 +163,7 @@ def predict_player_xp(df, teams_df, fixture_map):
     return df_feat
 
 # -----------------------------------------------------------------------------
-# 3. REALISTIC MILP SOLVER (BOBOT KHUSUS STARTING XI & BENCH)
+# 4. REALISTIC MILP SOLVER
 # -----------------------------------------------------------------------------
 def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=False):
     current_ids = [int(x) for x in current_ids]
@@ -167,7 +182,6 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     cap_vars = pulp.LpVariable.dicts("Cap", all_pids, cat='Binary')
     retain_vars = pulp.LpVariable.dicts("Retain", current_ids, cat='Binary')
 
-    # 1. Ukuran Skuad & Formasi
     prob += pulp.lpSum([squad_vars[i] for i in all_pids]) == 15
     prob += pulp.lpSum([start_vars[i] for i in all_pids]) == 11
     prob += pulp.lpSum([cap_vars[i] for i in all_pids]) == 1
@@ -176,10 +190,8 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
         prob += start_vars[i] <= squad_vars[i]
         prob += cap_vars[i] <= start_vars[i]
 
-    # 2. Budget Constraint
     prob += pulp.lpSum([(players.loc[players['id'] == i, 'now_cost'].values[0] / 10.0) * squad_vars[i] for i in all_pids]) <= total_budget
 
-    # 3. Kuota Posisi Sah FPL
     gkp_ids = players[players['element_type'] == 1]['id'].tolist()
     prob += pulp.lpSum([start_vars[i] for i in gkp_ids]) == 1
     prob += pulp.lpSum([squad_vars[i] for i in gkp_ids]) == 2
@@ -199,12 +211,10 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     prob += pulp.lpSum([start_vars[i] for i in fwd_ids]) <= 3
     prob += pulp.lpSum([squad_vars[i] for i in fwd_ids]) == 3
 
-    # 4. Batasan Maksimal 3 Pemain Per Klub
     for team_id in players['team'].unique():
         team_pids = players[players['team'] == team_id]['id'].tolist()
         prob += pulp.lpSum([squad_vars[i] for i in team_pids]) <= 3
 
-    # 5. Batasan Transfer & Penalti Hit
     for i in current_ids:
         prob += retain_vars[i] <= squad_vars[i]
 
@@ -212,13 +222,11 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     extra_transfers = pulp.LpVariable("ExtraTransfers", lowBound=0, cat='Integer')
     prob += extra_transfers >= transfers_made - free_transfers
 
-    # Tanpa Wildcard: Maksimal ekstra 2 transfer (max 3 total)
     if not use_chip_wildcard:
         prob += extra_transfers <= 2
 
     hit_penalty_cost = 0.0 if use_chip_wildcard else 4.0
 
-    # Objective: Starting XI (100%) + Captain (+100%) + Bench (10%) - Hit Penalty
     starting_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * start_vars[i] for i in all_pids])
     captain_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * cap_vars[i] for i in all_pids])
     bench_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * (squad_vars[i] - start_vars[i]) for i in all_pids])
@@ -234,7 +242,7 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
     return best_squad_ids, starting_ids, captain_id
 
 # -----------------------------------------------------------------------------
-# 4. STREAMLIT INTERFACE
+# 5. STREAMLIT INTERFACE
 # -----------------------------------------------------------------------------
 st.sidebar.header("📥 Import Data FPL")
 fpl_id = st.sidebar.text_input("Entry ID FPL:", value="", placeholder="Contoh: 123456")
