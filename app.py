@@ -6,8 +6,8 @@ import pulp
 from sklearn.ensemble import RandomForestRegressor
 
 # Config Halaman
-st.set_page_config(page_title="FPL Ultra-Fast MILP Optimizer", layout="wide")
-st.title("⚡ FPL Exact MILP & ML Optimizer")
+st.set_page_config(page_title="FPL Exact MILP Optimizer", layout="wide")
+st.title("⚡ FPL Ultra-Fast MILP & ML Optimizer")
 
 # -----------------------------------------------------------------------------
 # 1. FETCH DATA FROM FPL API
@@ -49,7 +49,7 @@ def get_player_role(row):
     return ", ".join(roles) if roles else "-"
 
 # -----------------------------------------------------------------------------
-# 2. MACHINE LEARNING ENGINE (RANDOM FOREST XP)
+# 2. MACHINE LEARNING ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def predict_player_xp(df, teams_df):
@@ -76,10 +76,8 @@ def predict_player_xp(df, teams_df):
         team_players = df_feat[df_feat['team'] == team_id]
         gk_players = team_players[team_players['element_type'] == 1].sort_values(by="form", ascending=False)
         gk_form = gk_players.iloc[0]['form'] if not gk_players.empty else 2.5
-        
         def_players = team_players[team_players['element_type'] == 2]
         avg_def_form = def_players['form'].mean() if not def_players.empty else 2.0
-        
         team_defense_stats[team_id] = round((gk_form * 0.4) + (avg_def_form * 0.6), 2)
 
     avg_league_def = np.mean(list(team_defense_stats.values())) if team_defense_stats else 2.0
@@ -116,7 +114,7 @@ def predict_player_xp(df, teams_df):
     return df_feat
 
 # -----------------------------------------------------------------------------
-# 3. MILP OPTIMIZER ENGINE (EXACT MATHEMATICAL OPTIMIZATION)
+# 3. MILP OPTIMIZER ENGINE
 # -----------------------------------------------------------------------------
 def run_milp_optimization(df, current_ids, bank, free_transfers):
     current_ids = [int(x) for x in current_ids]
@@ -128,53 +126,38 @@ def run_milp_optimization(df, current_ids, bank, free_transfers):
     current_cost = (current_squad_df['now_cost'] / 10.0).sum()
     total_budget = current_cost + bank
 
-    # Inisialisasi Solver MILP
     prob = pulp.LpProblem("FPL_Optimal_Transfer", pulp.LpMaximize)
 
-    # Variabel Keputusan (1 jika terpilih di skuad 15 baru)
     squad_vars = pulp.LpVariable.dicts("Squad", all_pids, cat='Binary')
-    # Variabel Keputusan (1 jika di-retain dari skuad lama)
     retain_vars = pulp.LpVariable.dicts("Retain", current_ids, cat='Binary')
 
-    # 1. Total Skuad Wajib 15 Pemain
     prob += pulp.lpSum([squad_vars[i] for i in all_pids]) == 15
-
-    # 2. Batasan Total Budget
     prob += pulp.lpSum([(players.loc[players['id'] == i, 'now_cost'].values[0] / 10.0) * squad_vars[i] for i in all_pids]) <= total_budget
 
-    # 3. Batasan Struktur Posisi (2 GKP, 5 DEF, 5 MID, 3 FWD)
     for pos_code, count in [(1, 2), (2, 5), (3, 5), (4, 3)]:
         pos_ids = players[players['element_type'] == pos_code]['id'].tolist()
         prob += pulp.lpSum([squad_vars[i] for i in pos_ids]) == count
 
-    # 4. Maksimal 3 Pemain Per Klub
     for team_id in players['team'].unique():
         team_pids = players[players['team'] == team_id]['id'].tolist()
         prob += pulp.lpSum([squad_vars[i] for i in team_pids]) <= 3
 
-    # 5. Hubungan Retain dan Squad
     for i in current_ids:
         prob += retain_vars[i] <= squad_vars[i]
 
-    # Menghitung Jumlah Transfer & Penalti Hit
     transfers_made = 15 - pulp.lpSum([retain_vars[i] for i in current_ids])
-    
-    # Variabel Linier untuk Extra Transfer Penalti
     extra_transfers = pulp.LpVariable("ExtraTransfers", lowBound=0, cat='Integer')
     prob += extra_transfers >= transfers_made - free_transfers
 
-    # Objective Function: Memaksimalkan Total xP Skuad dikurangi Penalti Hit Transfer
     total_xp = pulp.lpSum([players.loc[players['id'] == i, 'predicted_xP'].values[0] * squad_vars[i] for i in all_pids])
     prob += total_xp - (4.0 * extra_transfers)
 
-    # Solve Optimization
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
 
     best_squad_ids = [i for i in all_pids if squad_vars[i].varValue == 1]
     return best_squad_ids
 
 def select_starting_xi(squad_df):
-    """Memilih 11 Pemain Utama dengan Formasi Valid FPL (1 GKP, Min 3 DEF, Min 2 MID, Min 1 FWD)"""
     squad_df = squad_df.copy()
     gkps = squad_df[squad_df['element_type'] == 1].sort_values(by="predicted_xP", ascending=False)
     defs = squad_df[squad_df['element_type'] == 2].sort_values(by="predicted_xP", ascending=False)
@@ -182,10 +165,10 @@ def select_starting_xi(squad_df):
     fwds = squad_df[squad_df['element_type'] == 4].sort_values(by="predicted_xP", ascending=False)
     
     starting_ids = []
-    starting_ids.append(gkps.iloc[0]['id'])            # 1 Kiper
-    starting_ids.extend(defs.iloc[:3]['id'].tolist())   # 3 Bek
-    starting_ids.extend(mids.iloc[:2]['id'].tolist())   # 2 Gelandang
-    starting_ids.extend(fwds.iloc[:1]['id'].tolist())   # 1 Penyerang
+    starting_ids.append(gkps.iloc[0]['id'])
+    starting_ids.extend(defs.iloc[:3]['id'].tolist())
+    starting_ids.extend(mids.iloc[:2]['id'].tolist())
+    starting_ids.extend(fwds.iloc[:1]['id'].tolist())
     
     remaining_outfield = squad_df[
         (~squad_df['id'].isin(starting_ids)) & 
@@ -217,6 +200,9 @@ if bootstrap:
     teams = {t["id"]: t["name"] for t in bootstrap["teams"]}
     elements["team_name"] = elements["team"].map(teams)
     
+    # Buat label unik untuk pilihan pemain
+    elements["display_name"] = elements["web_name"] + " (" + elements["team_name"] + ") - #" + elements["id"].astype(str)
+    
     elements = predict_player_xp(elements, teams_df)
     
     if st.sidebar.button("Import Skuad FPL") and fpl_id:
@@ -224,6 +210,10 @@ if bootstrap:
         if u_data:
             st.session_state["user_ids"] = u_data["player_ids"]
             st.session_state["bank"] = u_data["bank"]
+            
+            # Paksa update widget multiselect
+            imported_labels = elements[elements["id"].isin(u_data["player_ids"])]["display_name"].tolist()
+            st.session_state["selected_squad_key"] = imported_labels
             st.sidebar.success(msg)
         else:
             st.sidebar.error(msg)
@@ -233,10 +223,18 @@ if bootstrap:
     chips_available = st.sidebar.multiselect("Chip Tersedia:", ["Wildcard", "Free Hit"], default=["Wildcard", "Free Hit"])
 
     st.subheader("📋 Skuad Terdaftar (15 Pemain)")
-    default_selected = elements[elements["id"].isin(st.session_state["user_ids"])]["web_name"].tolist()
     
-    selected_names = st.multiselect("Daftar Pemain Anda Saat Ini:", options=elements["web_name"].tolist(), default=default_selected)
-    current_df = elements[elements["web_name"].isin(selected_names)].copy()
+    # Inisialisasi default label jika belum ada di session state
+    if "selected_squad_key" not in st.session_state:
+        st.session_state["selected_squad_key"] = elements[elements["id"].isin(st.session_state["user_ids"])]["display_name"].tolist()
+        
+    selected_labels = st.multiselect(
+        "Daftar Pemain Anda Saat Ini:", 
+        options=elements["display_name"].tolist(), 
+        key="selected_squad_key"
+    )
+    
+    current_df = elements[elements["display_name"].isin(selected_labels)].copy()
 
     if not current_df.empty:
         st.dataframe(
@@ -248,7 +246,7 @@ if bootstrap:
             current_ids = [int(x) for x in current_df["id"].tolist()]
             
             if len(current_ids) != 15:
-                st.error("⚠️ Skuad Anda harus berjumlah tepat 15 pemain untuk menjalankan optimasi!")
+                st.error(f"⚠️ Skuad Anda saat ini terdeteksi {len(current_ids)} pemain. Pilih tepat 15 pemain di dropdown atas untuk menjalankan optimasi!")
             else:
                 with st.spinner("Memproses Solusi Matematis MILP..."):
                     best_squad_ids = run_milp_optimization(elements, current_ids, bank_money, free_transfers)
