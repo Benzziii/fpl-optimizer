@@ -1,314 +1,339 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
-from itertools import combinations
+import random
+from sklearn.ensemble import RandomForestRegressor
 
-st.set_page_config(
-    page_title="FPL Multi-Transfer & Squad Optimizer",
-    page_icon="⚽",
-    layout="wide"
-)
+# Config Halaman
+st.set_page_config(page_title="FPL Genetic Algorithm Optimizer", layout="wide")
+st.title("⚽ FPL Pure Genetic Algorithm & ML Optimizer")
 
+# -----------------------------------------------------------------------------
+# 1. FETCH DATA FROM FPL API
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def load_fpl_data():
-    base_url = "https://fantasy.premierleague.com/api/"
-    bootstrap = requests.get(f"{base_url}bootstrap-static/").json()
-    fixtures = requests.get(f"{base_url}fixtures/").json()
-    
-    players = pd.DataFrame(bootstrap['elements'])
-    teams = pd.DataFrame(bootstrap['teams']).set_index('id')['name'].to_dict()
-    element_types = pd.DataFrame(bootstrap['element_types']).set_index('id')['singular_name_short'].to_dict()
-    
-    players['team_name'] = players['team'].map(teams)
-    players['position'] = players['element_type'].map(element_types)
-    players['now_cost'] = players['now_cost'] / 10.0
-    players['form'] = pd.to_numeric(players['form'], errors='coerce').fillna(0)
-    
-    next_gw = None
-    for event in bootstrap['events']:
-        if event['is_next']:
-            next_gw = event['id']
-            break
-            
-    if not next_gw:
-        next_gw = 1
+def fetch_fpl_bootstrap():
+    url = "https://fantasy.premierleague.com/api/bootstrap-static/"
+    res = requests.get(url)
+    return res.json() if res.status_code == 200 else None
 
-    next_fixtures = [f for f in fixtures if f.get('event') == next_gw]
+def fetch_user_fpl(entry_id):
+    bootstrap = fetch_fpl_bootstrap()
+    if not bootstrap:
+        return None, "Gagal terhubung ke API FPL."
     
-    next_opponent_dict = {}
-    fdr_dict = {}
+    current_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_current'] or gw['is_next']][0]
     
-    for f in next_fixtures:
-        home_team = f['team_h']
-        away_team = f['team_a']
-        home_difficulty = f['team_h_difficulty']
-        away_difficulty = f['team_a_difficulty']
+    picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw}/picks/"
+    res = requests.get(picks_url)
+    if res.status_code != 200 and current_gw > 1:
+        picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw - 1}/picks/"
+        res = requests.get(picks_url)
         
-        next_opponent_dict[home_team] = f"{teams[away_team]} (H)"
-        fdr_dict[home_team] = home_difficulty
+    if res.status_code != 200:
+        return None, "ID FPL tidak ditemukan."
         
-        next_opponent_dict[away_team] = f"{teams[home_team]} (A)"
-        fdr_dict[away_team] = away_difficulty
-        
-    players['next_match'] = players['team'].map(next_opponent_dict).fillna("Blank / TBA")
-    players['next_fdr'] = players['team'].map(fdr_dict).fillna(3)
+    data = res.json()
+    bank = data.get("entry_history", {}).get("bank", 0) / 10.0
+    player_ids = [p["element"] for p in data.get("picks", [])]
     
-    return players, teams, fixtures, next_gw
+    return {"player_ids": player_ids, "bank": bank}, "Data skuad berhasil diimpor!"
 
-try:
-    players_df, teams_dict, fixtures_data, next_gw = load_fpl_data()
-except Exception as e:
-    st.error("Failed to load FPL API data. Check internet connection.")
-    st.stop()
-
-def calculate_expected_points(df):
-    chance_mult = df['chance_of_playing_next_round'].fillna(100) / 100.0
-    fdr_multiplier = df['next_fdr'].apply(lambda fdr: 1.25 if fdr <= 2 else (0.75 if fdr >= 4 else 1.0))
-    df['xP'] = (df['form'] * chance_mult * fdr_multiplier).round(2)
+# -----------------------------------------------------------------------------
+# 2. MACHINE LEARNING ENGINE (PREDICT XP VIA RANDOM FOREST)
+# -----------------------------------------------------------------------------
+def predict_player_xp(df):
+    df_feat = df.copy()
+    
+    df_feat['form'] = pd.to_numeric(df_feat['form'], errors='coerce').fillna(0)
+    df_feat['ict_index'] = pd.to_numeric(df_feat['ict_index'], errors='coerce').fillna(0)
+    df_feat['points_per_game'] = pd.to_numeric(df_feat['points_per_game'], errors='coerce').fillna(0)
+    df_feat['selected_by_percent'] = pd.to_numeric(df_feat['selected_by_percent'], errors='coerce').fillna(0)
+    df_feat['ep_next'] = pd.to_numeric(df_feat['ep_next'], errors='coerce').fillna(0)
+    
+    X = df_feat[['form', 'ict_index', 'points_per_game', 'selected_by_percent', 'ep_next']]
+    
+    y_target = (
+        df_feat['form'] * 0.35 + 
+        df_feat['ict_index'] * 0.05 + 
+        df_feat['points_per_game'] * 0.35 + 
+        df_feat['ep_next'] * 0.25
+    ) * np.where(df_feat['status'] == 'a', 1.0, 0.15)
+    
+    rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
+    rf.fit(X, y_target)
+    
+    df['predicted_xP'] = np.round(rf.predict(X), 2)
     return df
 
-players_df = calculate_expected_points(players_df)
+# -----------------------------------------------------------------------------
+# 3. GENETIC ALGORITHM OPTIMIZER (DYNAMIC TRANSFERS & SQUAD SELECTION)
+# -----------------------------------------------------------------------------
+def run_genetic_algorithm(df, current_ids, bank, free_transfers, pop_size=80, generations=50):
+    all_ids = df['id'].tolist()
+    id_to_price = dict(zip(df['id'], df['now_cost'] / 10.0))
+    id_to_xp = dict(zip(df['id'], df['predicted_xP']))
+    id_to_pos = dict(zip(df['id'], df['element_type'])) # 1: GKP, 2: DEF, 3: MID, 4: FWD
+    id_to_team = dict(zip(df['id'], df['team']))
 
-st.title(f"⚽ FPL Auto-Optimal Transfer & Squad Optimizer (GW {next_gw})")
+    current_cost = sum(id_to_price[i] for i in current_ids)
+    max_budget = current_cost + bank
 
-st.sidebar.header("⚙️ Konfigurasi Tim & Transfer")
-st.sidebar.subheader("🆔 Sync Otomatis ID Tim FPL")
-team_id_input = st.sidebar.text_input("Masukkan FPL Team ID Anda:", value="4231710")
-
-all_player_names = sorted(players_df['web_name'].unique())
-fetched_squad_names = []
-
-if team_id_input:
-    try:
-        current_gw = next_gw - 1 if next_gw > 1 else 1
-        entry_url = f"https://fantasy.premierleague.com/api/entry/{team_id_input}/event/{current_gw}/picks/"
-        res = requests.get(entry_url)
-        if res.status_code == 200:
-            picks_data = res.json().get('picks', [])
-            player_ids = [p['element'] for p in picks_data]
-            fetched_squad_names = players_df[players_df['id'].isin(player_ids)]['web_name'].tolist()
-            st.sidebar.success(f"Berhasil menarik 15 pemain dari ID: {team_id_input}!")
-        else:
-            st.sidebar.error("ID Tim tidak ditemukan.")
-    except Exception:
-        st.sidebar.error("Gagal mengambil data dari FPL.")
-
-if fetched_squad_names:
-    default_selection = fetched_squad_names
-elif 'saved_squad' in st.session_state:
-    default_selection = st.session_state['saved_squad']
-else:
-    default_selection = all_player_names[:15] if len(all_player_names) >= 15 else []
-
-st.sidebar.subheader("📌 Masukkan/Ubah Skuad")
-selected_squad_names = st.sidebar.multiselect(
-    "Pilih 15 Pemain dalam Tim Anda:",
-    options=all_player_names,
-    default=default_selection
-)
-
-if st.sidebar.button("💾 Simpan Skuad Saat Ini"):
-    st.session_state['saved_squad'] = selected_squad_names
-    st.sidebar.success("Skuad disimpan!")
-
-# Opsi Menu Rentang Transfer (1 - 5 Pemain)
-st.sidebar.subheader("🎯 Batas Evaluasi Transfer")
-target_transfer_mode = st.sidebar.select_slider(
-    "Pilih Batas Maksimal Transfer Ditinjau:",
-    options=[1, 2, 3, 4, 5],
-    value=4
-)
-
-free_transfers = st.sidebar.number_input("Jumlah Free Transfer Tersedia", min_value=1, max_value=5, value=1)
-bank_budget = st.sidebar.number_input("Sisa Anggaran di Bank (£M)", min_value=0.0, max_value=15.0, value=0.5, step=0.1)
-
-squad_df = players_df[players_df['web_name'].isin(selected_squad_names)].copy()
-
-tab1, tab2, tab3 = st.tabs(["🔄 Rekomendasi Optimal (Fast)", "📋 Skuad Pasca-Transfer & Kapten", "🔍 Database Pemain"])
-
-# ---------------------------------------------------------
-# TAB 1: FAST OPTIMIZATION (PRUNED COMBINATIONS 1 - 5)
-# ---------------------------------------------------------
-with tab1:
-    st.subheader("🎯 Hasil Transfer Paling Optimum")
-    st.caption(f"Algorithmic Pruning aktif: Mengevaluasi skenario 1 s.d. {target_transfer_mode} transfer dengan memprioritaskan pelepasan pemain berkinerja rendah/cedera.")
-
-    recommendations = []
-    if len(squad_df) < 15:
-        st.warning(f"Lengkapi 15 pemain di sidebar untuk menjalankan optimasi. (Saat ini: {len(squad_df)}/15)")
-    else:
-        with st.spinner(f"Menghitung kombinasi transfer 1-{target_transfer_mode} pemain..."):
-            # PRUNING 1: Batasi kandidat keluar ke 8 pemain berkinerja terburuk/cedera
-            out_candidates = squad_df.sort_values(by=['chance_of_playing_next_round', 'xP'], ascending=[True, True]).head(8).to_dict('records')
+    # Fungsi Cek Validitas Skuad FPL (15 Pemain)
+    def is_valid_squad(squad_ids):
+        if len(squad_ids) != 15: return False
+        
+        # 1. Budget Constraint
+        if sum(id_to_price[i] for i in squad_ids) > max_budget: return False
+        
+        # 2. Position Constraint (2 GKP, 5 DEF, 5 MID, 3 FWD)
+        pos_counts = {1:0, 2:0, 3:0, 4:0}
+        for i in squad_ids:
+            pos_counts[id_to_pos[i]] += 1
+        if pos_counts != {1:2, 2:5, 3:5, 4:3}: return False
+        
+        # 3. Max 3 Players per Team
+        team_counts = {}
+        for i in squad_ids:
+            t = id_to_team[i]
+            team_counts[t] = team_counts.get(t, 0) + 1
+            if team_counts[t] > 3: return False
             
-            # PRUNING 2: Batasi kandidat masuk ke Top 4 xP per posisi
-            top_in_candidates = players_df[
-                (~players_df['web_name'].isin(selected_squad_names)) &
-                (players_df['chance_of_playing_next_round'].fillna(100) >= 75)
-            ].sort_values(by='xP', ascending=False).groupby('position').head(4).to_dict('records')
+        return True
 
-            # EVALUASI TERARAH BERDASARKAN TARGET USER (1 s.d. 5)
-            for n_transfers in range(1, target_transfer_mode + 1):
-                extra_transfers = max(0, n_transfers - free_transfers)
-                hit_penalty = extra_transfers * 4
+    # Fitness Function (Total xP dikurangi Penalti Hit Transfer -4 pt per Extra Transfer)
+    def calculate_fitness(squad_ids):
+        transfers_made = len(set(squad_ids) - set(current_ids))
+        extra_transfers = max(0, transfers_made - free_transfers)
+        hit_penalty = extra_transfers * 4.0
+        
+        total_xp = sum(id_to_xp[i] for i in squad_ids)
+        return total_xp - hit_penalty
 
-                for out_comb in combinations(out_candidates, n_transfers):
-                    out_cost_sum = sum([p['now_cost'] for p in out_comb])
-                    out_xp_sum = sum([p['xP'] for p in out_comb])
-                    available_budget = out_cost_sum + bank_budget
-                    out_positions = [p['position'] for p in out_comb]
+    # --- INISIALISASI POPULASI ---
+    population = []
+    if is_valid_squad(current_ids):
+        population.append(current_ids)
 
-                    for in_comb in combinations(top_in_candidates, n_transfers):
-                        in_positions = [p['position'] for p in in_comb]
-                        if sorted(out_positions) == sorted(in_positions):
-                            in_cost_sum = sum([p['now_cost'] for p in in_comb])
-                            
-                            if in_cost_sum <= available_budget:
-                                in_xp_sum = sum([p['xP'] for p in in_comb])
-                                gross_xp_gain = in_xp_sum - out_xp_sum
-                                net_xp_gain = gross_xp_gain - hit_penalty
+    # Generate Variasi Skuad Awal (Termasuk 0, 1, 2, 3+ Transfer)
+    attempts = 0
+    while len(population) < pop_size and attempts < 2000:
+        attempts += 1
+        num_swaps = random.randint(0, 4) # Menguji variasi 0 hingga 4 transfer
+        candidate = list(current_ids)
+        
+        for _ in range(num_swaps):
+            if candidate:
+                idx_remove = random.randint(0, len(candidate) - 1)
+                candidate.pop(idx_remove)
+                
+            new_pick = random.choice(all_ids)
+            if new_pick not in candidate:
+                candidate.append(new_pick)
+                
+        if is_valid_squad(candidate):
+            population.append(candidate)
 
-                                if net_xp_gain > 0.5:
-                                    recommendations.append({
-                                        'Opsi Transfer': f"{n_transfers} Pemain",
-                                        'Penalti Hit': f"-{hit_penalty} pts" if hit_penalty > 0 else "0 pts (Free)",
-                                        'Pemain Keluar': ", ".join([p['web_name'] for p in out_comb]),
-                                        'Pemain Masuk': ", ".join([p['web_name'] for p in in_comb]),
-                                        'Sisa Budget': round(bank_budget - (in_cost_sum - out_cost_sum), 2),
-                                        'Gross Gain': round(gross_xp_gain, 2),
-                                        'Net Gain (ROI)': round(net_xp_gain, 2)
-                                    })
+    if not population:
+        population = [current_ids]
 
-        rec_df = pd.DataFrame(recommendations)
-
-        if not rec_df.empty:
-            rec_df = rec_df.sort_values(by='Net Gain (ROI)', ascending=False).drop_duplicates(subset=['Pemain Keluar', 'Pemain Masuk']).reset_index(drop=True)
+    # --- EVOLUSI (GENETIC ALGORITHM ITERATION) ---
+    for _ in range(generations):
+        population = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)
+        survivors = population[:pop_size // 2]
+        
+        children = []
+        while len(survivors) + len(children) < pop_size:
+            p1, p2 = random.sample(survivors, 2)
             
-            best_option = rec_df.iloc[0]
-            st.success(f"🏆 **Rekomendasi Terbaik**: Lakukan **{best_option['Opsi Transfer']}** (Penalti: {best_option['Penalti Hit']}) untuk potensi peningkatan bersih **+{best_option['Net Gain (ROI)']} poin**!")
+            # Crossover (Pindah Silang)
+            split = random.randint(1, 14)
+            child = list(set(p1[:split] + p2[split:]))
+            
+            # Perbaiki jika panjang gen berkurang akibat deduplikasi set
+            missing = [i for i in all_ids if i not in child]
+            random.shuffle(missing)
+            while len(child) < 15 and missing:
+                child.append(missing.pop())
+                
+            # Mutasi
+            if random.random() < 0.35:
+                m_idx = random.randint(0, 14)
+                rand_p = random.choice(all_ids)
+                if rand_p not in child:
+                    child[m_idx] = rand_p
+                    
+            if is_valid_squad(child):
+                children.append(child)
+                
+        population = survivors + children
 
-            st.dataframe(rec_df.head(10), use_container_width=True)
-        else:
-            st.success("Skuad Anda saat ini sudah optimal. Melakukan transfer tambahan tidak disarankan untuk gameweek ini.")
+    best_squad = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)[0]
+    return best_squad
 
-# ---------------------------------------------------------
-# TAB 2: SKUAD PASCA-TRANSFER & SIMULASI KAPTEN
-# ---------------------------------------------------------
-with tab2:
-    st.subheader(f"📋 Analisis Skuad Baru Pasca-Transfer (GW {next_gw})")
+def select_starting_xi(squad_df):
+    """Memilih 11 Pemain Utama dengan Formasi Valid FPL (1 GKP, Min 3 DEF, Min 2 MID, Min 1 FWD)"""
+    gkps = squad_df[squad_df['element_type'] == 1].sort_values(by="predicted_xP", ascending=False)
+    defs = squad_df[squad_df['element_type'] == 2].sort_values(by="predicted_xP", ascending=False)
+    mids = squad_df[squad_df['element_type'] == 3].sort_values(by="predicted_xP", ascending=False)
+    fwds = squad_df[squad_df['element_type'] == 4].sort_values(by="predicted_xP", ascending=False)
     
-    if len(squad_df) < 15:
-        st.info("Lengkapi 15 pemain di sidebar terlebih dahulu.")
-    else:
-        st.markdown("#### ⚙️ Pilih Opsi Hasil Transfer")
-        
-        if not rec_df.empty:
-            transfer_options = ["(Tanpa Transfer - Gunakan Skuad Asli)"] + [
-                f"[{row['Opsi Transfer']} | {row['Penalti Hit']}] Out: {row['Pemain Keluar']} ➡️ In: {row['Pemain Masuk']} (+{row['Net Gain (ROI)']} pts)"
-                for _, row in rec_df.iterrows()
-            ]
-            selected_transfer_str = st.selectbox("Terapkan Hasil Transfer ke Skuad:", options=transfer_options, index=1)
+    starting_ids = []
+    starting_ids.append(gkps.iloc[0]['id']) # 1 Kiper
+    starting_ids.extend(defs.iloc[:3]['id'].tolist()) # 3 Bek
+    starting_ids.extend(mids.iloc[:2]['id'].tolist()) # 2 Gelandang
+    starting_ids.extend(fwds.iloc[:1]['id'].tolist()) # 1 Penyerang
+    
+    remaining_outfield = squad_df[
+        (~squad_df['id'].isin(starting_ids)) & 
+        (squad_df['element_type'] != 1)
+    ].sort_values(by="predicted_xP", ascending=False)
+    
+    starting_ids.extend(remaining_outfield.iloc[:4]['id'].tolist())
+    
+    starting_xi = squad_df[squad_df['id'].isin(starting_ids)].sort_values(by="predicted_xP", ascending=False)
+    bench = squad_df[~squad_df['id'].isin(starting_ids)].sort_values(by="predicted_xP", ascending=False)
+    
+    return starting_xi, bench
+
+# -----------------------------------------------------------------------------
+# 4. STREAMLIT INTERFACE
+# -----------------------------------------------------------------------------
+st.sidebar.header("📥 Import Data FPL")
+fpl_id = st.sidebar.text_input("Entry ID FPL:", value="", placeholder="Contoh: 123456")
+
+if "user_ids" not in st.session_state: st.session_state["user_ids"] = []
+if "bank" not in st.session_state: st.session_state["bank"] = 0.5
+
+bootstrap = fetch_fpl_bootstrap()
+
+if bootstrap:
+    elements = pd.DataFrame(bootstrap["elements"])
+    teams = {t["id"]: t["name"] for t in bootstrap["teams"]}
+    elements["team_name"] = elements["team"].map(teams)
+    
+    # ML Prediction
+    elements = predict_player_xp(elements)
+    
+    if st.sidebar.button("Import Skuad FPL") and fpl_id:
+        u_data, msg = fetch_user_fpl(fpl_id)
+        if u_data:
+            st.session_state["user_ids"] = u_data["player_ids"]
+            st.session_state["bank"] = u_data["bank"]
+            st.sidebar.success(msg)
         else:
-            selected_transfer_str = "(Tanpa Transfer - Gunakan Skuad Asli)"
-            st.info("Tidak ada rekomendasi transfer. Menampilkan analisis skuad asli Anda.")
-
-        post_squad_names = selected_squad_names.copy()
-        applied_penalty = 0
-
-        if selected_transfer_str != "(Tanpa Transfer - Gunakan Skuad Asli)":
-            idx = transfer_options.index(selected_transfer_str) - 1
-            chosen_rec = rec_df.iloc[idx]
+            st.sidebar.error(msg)
             
-            out_list = chosen_rec['Pemain Keluar'].split(", ")
-            in_list = chosen_rec['Pemain Masuk'].split(", ")
-            
-            for out_p in out_list:
-                if out_p in post_squad_names:
-                    post_squad_names.remove(out_p)
-            for in_p in in_list:
-                post_squad_names.append(in_p)
-            
-            n_tx = int(chosen_rec['Opsi Transfer'].split()[0])
-            extra_tx = max(0, n_tx - free_transfers)
-            applied_penalty = extra_tx * 4
+    bank_money = st.sidebar.number_input("Budget Sisa di Bank (£m):", min_value=0.0, max_value=20.0, value=float(st.session_state["bank"]), step=0.1)
+    free_transfers = st.sidebar.number_input("Free Transfer Tersedia:", min_value=1, max_value=5, value=1)
+    chips_available = st.sidebar.multiselect("Chip Tersedia:", ["Wildcard", "Free Hit"], default=["Wildcard", "Free Hit"])
 
-        post_squad_df = players_df[players_df['web_name'].isin(post_squad_names)].copy()
-        post_squad_df = post_squad_df.sort_values(by='xP', ascending=False)
+    st.subheader("📋 Skuad Terdaftar (15 Pemain)")
+    default_selected = elements[elements["id"].isin(st.session_state["user_ids"])]["web_name"].tolist()
+    
+    selected_names = st.multiselect("Daftar Pemain Anda Saat Ini:", options=elements["web_name"].tolist(), default=default_selected)
+    current_df = elements[elements["web_name"].isin(selected_names)].copy()
 
-        st.divider()
-
-        top_captain = post_squad_df.iloc[0]['web_name']
-        top_vc = post_squad_df.iloc[1]['web_name'] if len(post_squad_df) > 1 else top_captain
-
-        st.markdown("### 👑 Pemilihan Kapten (Skuad Baru)")
-        col_c1, col_c2 = st.columns(2)
-        
-        selected_captain = col_c1.selectbox(
-            "Pilih Kapten (2x Poin):",
-            options=post_squad_df['web_name'].tolist(),
-            index=0
-        )
-        
-        remaining_vc_options = [p for p in post_squad_df['web_name'].tolist() if p != selected_captain]
-        selected_vc = col_c2.selectbox(
-            "Pilih Vice-Captain:",
-            options=remaining_vc_options,
-            index=0
-        )
-
-        captain_xp = post_squad_df[post_squad_df['web_name'] == selected_captain]['xP'].values[0]
-        base_squad_xp = post_squad_df['xP'].sum()
-        final_achieved_xp = round(base_squad_xp + captain_xp - applied_penalty, 2)
-
-        st.info(f"💡 **Rekomendasi Kapten Skuad Baru**: **{top_captain}** (Base xP: {post_squad_df.iloc[0]['xP']}) & Vice-Captain **{top_vc}**")
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total xP Achieved (GW Depan)", final_achieved_xp)
-        col2.metric("Ekstra Poin Kapten", f"+{captain_xp} pts")
-        col3.metric("Penalti Transfer (Hit)", f"-{applied_penalty} pts" if applied_penalty > 0 else "0 pts")
-        
-        flagged_players = post_squad_df[post_squad_df['chance_of_playing_next_round'] < 100]
-        col4.metric("Pemain Cedera/Bermasalah", len(flagged_players))
-
-        post_squad_display = post_squad_df.copy()
-        post_squad_display['Role'] = post_squad_display['web_name'].apply(
-            lambda name: "👑 Captain" if name == selected_captain else ("🛡️ Vice-Captain" if name == selected_vc else "Player")
-        )
-
+    if not current_df.empty:
         st.dataframe(
-            post_squad_display[['Role', 'web_name', 'position', 'team_name', 'next_match', 'next_fdr', 'now_cost', 'chance_of_playing_next_round', 'xP']]
-            .rename(columns={
-                'web_name': 'Nama',
-                'position': 'Pos',
-                'team_name': 'Klub',
-                'next_match': 'Lawan GW Depan',
-                'next_fdr': 'FDR',
-                'now_cost': 'Harga (£M)',
-                'chance_of_playing_next_round': 'Peluang Main (%)',
-                'xP': 'Base xP'
-            }),
-            hide_index=True,
+            current_df[["web_name", "team_name", "element_type", "now_cost", "status", "form", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0),
             use_container_width=True
         )
 
-# ---------------------------------------------------------
-# TAB 3: DATABASE PEMAIN
-# ---------------------------------------------------------
-with tab3:
-    st.subheader("🔍 Database Pemain & Tren Performa")
-    
-    col_f1, col_f2 = st.columns(2)
-    pos_filter = col_f1.multiselect("Filter Posisi", options=list(players_df['position'].unique()), default=list(players_df['position'].unique()))
-    max_price = col_f2.slider("Maksimal Harga (£M)", 4.0, 15.0, 15.0, 0.5)
+        if st.button("🧬 JALANKAN OPTIMASI GENETIC ALGORITHM & ML"):
+            current_ids = current_df["id"].tolist()
+            
+            with st.spinner("Genetic Algorithm sedang mensimulasikan evolusi kombinasi transfer & menentukan jumlah transfer paling optimal..."):
+                best_squad_ids = run_genetic_algorithm(elements, current_ids, bank_money, free_transfers)
+                final_squad_df = elements[elements['id'].isin(best_squad_ids)].copy()
+                starting_xi, bench = select_starting_xi(final_squad_df)
+                
+            st.divider()
 
-    filtered_players = players_df[
-        (players_df['position'].isin(pos_filter)) &
-        (players_df['now_cost'] <= max_price)
-    ].sort_values(by='xP', ascending=False)
+            # --- IDENTIFIKASI PERUBAHAN TRANSFER DARI GA ---
+            transfers_out_ids = list(set(current_ids) - set(best_squad_ids))
+            transfers_in_ids = list(set(best_squad_ids) - set(current_ids))
+            
+            t_out_df = elements[elements['id'].isin(transfers_out_ids)]
+            t_in_df = elements[elements['id'].isin(transfers_in_ids)]
 
-    st.dataframe(
-        filtered_players[['web_name', 'position', 'team_name', 'next_match', 'next_fdr', 'now_cost', 'form', 'selected_by_percent', 'xP']]
-        .rename(columns={'web_name': 'Nama', 'position': 'Pos', 'team_name': 'Klub', 'next_match': 'Lawan GW Depan', 'next_fdr': 'FDR', 'now_cost': 'Harga (£M)', 'selected_by_percent': 'Kepemilikan (%)'}),
-        hide_index=True,
-        use_container_width=True
-    )
+            # -----------------------------------------------------------------
+            # OUTPUT 1: REKOMENDASI TRANSFER (GA) & CHIP
+            # -----------------------------------------------------------------
+            st.subheader("1. 🔄 Hasil Rekomendasi Transfer (Optimasi Genetic Algorithm)")
+            
+            num_transfers = len(transfers_in_ids)
+            extra_transfers = max(0, num_transfers - free_transfers)
+            hit_cost = extra_transfers * 4
+            
+            # Evaluasi Chip
+            injured_count = len(current_df[current_df['status'] != 'a'])
+            chip_msg = "Saran Chip: Tidak perlu menggunakan Chip pekan ini."
+            
+            if num_transfers >= 4 and "Wildcard" in chips_available:
+                chip_msg = "⚠️ **Saran Chip:** Sangat disarankan mengaktifkan **WILDCARD**! Jumlah pergantian optimal dari GA terlalu banyak untuk transfer biasa."
+            elif injured_count >= 3 and "Free Hit" in chips_available:
+                chip_msg = "💡 **Saran Chip:** Pertimbangkan **FREE HIT** untuk menghindari pengurangan poin berlebih akibat pemain cedera."
+                
+            st.info(f"**Strategi Chip:** {chip_msg}")
+
+            if num_transfers == 0:
+                st.success("✅ **Saran Transfer dari GA:** **TIDAK ADA TRANSFER (0 Transfer)**. Kombinasi tim eksisting Anda sudah merupakan titik puncak poin optimal pekan ini.")
+            else:
+                st.success(f"✅ **Saran Transfer dari GA:** Genetic Algorithm menemukan bahwa **{num_transfers} Transfer** adalah opsi paling optimal (Penalti Hit: -{hit_cost} Pts).")
+                
+                col_t1, col_t2 = st.columns(2)
+                with col_t1:
+                    st.markdown("🔴 **Pemain Keluar (Transfer Out):**")
+                    st.dataframe(t_out_df[["web_name", "team_name", "now_cost", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
+                with col_t2:
+                    st.markdown("🟢 **Pemain Masuk (Transfer In):**")
+                    st.dataframe(t_in_df[["web_name", "team_name", "now_cost", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
+
+            # -----------------------------------------------------------------
+            # OUTPUT 2: STARTING LINEUP, CAPTAIN & EXPECTED POINTS
+            # -----------------------------------------------------------------
+            st.subheader("2. 🏆 Starting Lineup & Pemilihan Kapten (Next Week)")
+            
+            captain = starting_xi.iloc[0]
+            vice_captain = starting_xi.iloc[1]
+            
+            # Net Expected Points = Total xP Starting XI + (2x xP Captain) - Hit Penalty Transfer
+            raw_total_pts = starting_xi['predicted_xP'].sum() + captain['predicted_xP']
+            net_expected_pts = raw_total_pts - hit_cost
+            
+            col_cap1, col_cap2, col_cap3 = st.columns(3)
+            with col_cap1:
+                st.metric("👑 CAPTAIN", f"{captain['web_name']}", f"{captain['predicted_xP'] * 2} xP")
+            with col_cap2:
+                st.metric("🎖️ VICE-CAPTAIN", f"{vice_captain['web_name']}", f"{vice_captain['predicted_xP']} xP")
+            with col_cap3:
+                st.metric("📊 NET PROYEKSI POIN (Setlah Hit)", f"{round(net_expected_pts, 2)} Pts")
+
+            st.markdown("---")
+            st.markdown("### 🟢 Starting Eleven (11 Pemain Utama)")
+            st.dataframe(
+                starting_xi[["web_name", "team_name", "element_type", "form", "status", "predicted_xP"]]
+                .rename(columns={
+                    "web_name": "Nama Pemain", 
+                    "team_name": "Klub", 
+                    "element_type": "Posisi (1:GKP, 2:DEF, 3:MID, 4:FWD)",
+                    "predicted_xP": "Expected Points (xP)"
+                }),
+                use_container_width=True
+            )
+
+            st.markdown("### 🪑 Bench (4 Pemain Cadangan)")
+            st.dataframe(
+                bench[["web_name", "team_name", "element_type", "form", "status", "predicted_xP"]]
+                .rename(columns={
+                    "web_name": "Nama Pemain", 
+                    "team_name": "Klub", 
+                    "element_type": "Posisi",
+                    "predicted_xP": "Expected Points (xP)"
+                }),
+                use_container_width=True
+            )
+else:
+    st.error("Gagal terhubung ke API Fantasy Premier League.")
