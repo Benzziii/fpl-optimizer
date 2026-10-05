@@ -26,6 +26,7 @@ def fetch_user_fpl(entry_id):
     
     current_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_current'] or gw['is_next']][0]
     
+    # 1. Fetch Picks
     picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw}/picks/"
     res = requests.get(picks_url)
     if res.status_code != 200 and current_gw > 1:
@@ -39,7 +40,30 @@ def fetch_user_fpl(entry_id):
     bank = data.get("entry_history", {}).get("bank", 0) / 10.0
     player_ids = [p["element"] for p in data.get("picks", [])]
     
-    return {"player_ids": player_ids, "bank": bank}, "Data skuad berhasil diimpor!"
+    # 2. Fetch History untuk cek Chip yang SUDAH DIPAKAI
+    used_chips = []
+    hist_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/history/"
+    res_hist = requests.get(hist_url)
+    if res_hist.status_code == 200:
+        chips_data = res_hist.json().get("chips", [])
+        for c in chips_data:
+            # Map nama chip API ke nama tampilan
+            c_name = c.get("name")
+            if c_name == "wildcard": used_chips.append("Wildcard")
+            elif c_name == "freehit": used_chips.append("Free Hit")
+            elif c_name == "bboost": used_chips.append("Bench Boost")
+            elif c_name == "3xc": used_chips.append("Triple Captain")
+
+    # Hitung Chip yang MASIH TERSEDIA
+    all_possible_chips = ["Wildcard", "Free Hit", "Bench Boost", "Triple Captain"]
+    available_chips = [c for c in all_possible_chips if c not in used_chips]
+    
+    return {
+        "player_ids": player_ids, 
+        "bank": bank, 
+        "available_chips": available_chips,
+        "used_chips": used_chips
+    }, "Data skuad & status chip berhasil diimpor!"
 
 # -----------------------------------------------------------------------------
 # 2. MACHINE LEARNING ENGINE (PREDICT XP VIA RANDOM FOREST)
@@ -72,7 +96,7 @@ def predict_player_xp(df):
 # 3. OPTIMIZER ENGINES (MILP & GENETIC ALGORITHM)
 # -----------------------------------------------------------------------------
 
-# --- A. MILP SOLVER (PULP) ---
+# --- A. MILP SOLVER (PULP SAFE INITIALIZATION) ---
 def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=False):
     all_pids = df['id'].tolist()
     
@@ -86,13 +110,13 @@ def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=
 
     prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
 
-    # Decision Variables
-    squad_vars = pulp.LpVariable.dicts("Squad", all_pids, cat='Binary')
-    start_vars = pulp.LpVariable.dicts("Start", all_pids, cat='Binary')
-    cap_vars = pulp.LpVariable.dicts("Captain", all_pids, cat='Binary')
+    # Decision Variables (Inisialisasi Aman tanpa AttributeError)
+    squad_vars = {i: pulp.LpVariable(f"Squad_{i}", cat='Binary') for i in all_pids}
+    start_vars = {i: pulp.LpVariable(f"Start_{i}", cat='Binary') for i in all_pids}
+    cap_vars   = {i: pulp.LpVariable(f"Captain_{i}", cat='Binary') for i in all_pids}
 
-    transfer_out = pulp.LpVariable.dicts("TransferOut", all_pids, cat='Binary')
-    transfer_in = pulp.LpVariable.dicts("TransferIn", all_pids, cat='Binary')
+    transfer_out = {i: pulp.LpVariable(f"TransferOut_{i}", cat='Binary') for i in all_pids}
+    transfer_in  = {i: pulp.LpVariable(f"TransferIn_{i}", cat='Binary') for i in all_pids}
 
     # Hit Penalty Logic
     if use_chip_wildcard:
@@ -238,8 +262,6 @@ def run_genetic_algorithm(df, current_ids, bank, free_transfers, use_chip_wildca
     best_squad = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)[0]
     return best_squad
 
-
-# --- HELPER SELEKSI STARTING XI ---
 def select_starting_xi(squad_df):
     gkps = squad_df[squad_df['element_type'] == 1].sort_values(by="predicted_xP", ascending=False)
     defs = squad_df[squad_df['element_type'] == 2].sort_values(by="predicted_xP", ascending=False)
@@ -272,6 +294,8 @@ fpl_id = st.sidebar.text_input("Entry ID FPL:", value="", placeholder="Contoh: 1
 
 if "user_ids" not in st.session_state: st.session_state["user_ids"] = []
 if "bank" not in st.session_state: st.session_state["bank"] = 0.5
+if "available_chips" not in st.session_state: st.session_state["available_chips"] = ["Wildcard", "Bench Boost", "Triple Captain"]
+if "used_chips" not in st.session_state: st.session_state["used_chips"] = []
 
 bootstrap = fetch_fpl_bootstrap()
 
@@ -288,6 +312,8 @@ if bootstrap:
         if u_data:
             st.session_state["user_ids"] = u_data["player_ids"]
             st.session_state["bank"] = u_data["bank"]
+            st.session_state["available_chips"] = u_data["available_chips"]
+            st.session_state["used_chips"] = u_data["used_chips"]
             st.sidebar.success(msg)
         else:
             st.sidebar.error(msg)
@@ -295,21 +321,22 @@ if bootstrap:
     bank_money = st.sidebar.number_input("Budget Sisa di Bank (£m):", min_value=0.0, max_value=20.0, value=float(st.session_state["bank"]), step=0.1)
     free_transfers = st.sidebar.number_input("Free Transfer Tersedia:", min_value=1, max_value=5, value=1)
     
-    chips_available = st.sidebar.multiselect("Chip Tersedia:", ["Wildcard", "Free Hit", "Bench Boost", "Triple Captain"], default=["Wildcard", "Free Hit"])
+    chips_available = st.sidebar.multiselect(
+        "Chip Tersedia:", 
+        options=["Wildcard", "Free Hit", "Bench Boost", "Triple Captain"], 
+        default=st.session_state["available_chips"]
+    )
     
-    # KONTROL BARU: PILIH CHIP UNTUK DIEKSEKUSI PEKAN INI
+    if st.session_state["used_chips"]:
+        st.sidebar.info(f"ℹ️ **Chip Sudah Dipakai:** {', '.join(st.session_state['used_chips'])}")
+
     active_chip = st.sidebar.selectbox(
         "⚡ Eksekusi Chip Pekan Ini:",
         options=["Tanpa Chip"] + chips_available,
-        index=0,
-        help="Pilih 'Wildcard' untuk perombakan total tanpa penalti hit -4 poin."
+        index=0
     )
 
     use_wildcard = (active_chip == "Wildcard")
-    use_free_hit = (active_chip == "Free Hit")
-
-    if ("Wildcard" in chips_available or "Free Hit" in chips_available) and active_chip == "Tanpa Chip":
-        st.sidebar.warning("💡 **Tips Paruh Pertama:** Jangan lupa gunakan Wildcard / Free Hit sebelum reset paruh musim agar chip Anda tidak hangus!")
 
     st.subheader("📋 Skuad Terdaftar (15 Pemain)")
     default_selected = elements[elements["id"].isin(st.session_state["user_ids"])]["web_name"].tolist()
@@ -324,17 +351,14 @@ if bootstrap:
         )
 
         col_opt1, col_opt2 = st.columns(2)
-        
-        # --- TOMBOL OPTIMASI 1: REALISTIC MILP ---
         run_milp = col_opt1.button("🎯 JALANKAN OPTIMASI REALISTIS (MILP Solver)", use_container_width=True)
-        # --- TOMBOL OPTIMASI 2: GENETIC ALGORITHM ---
         run_ga = col_opt2.button("🧬 JALANKAN OPTIMASI GENETIC ALGORITHM", use_container_width=True)
 
         if run_milp or run_ga:
             current_ids = current_df["id"].tolist()
             
             if run_milp:
-                with st.spinner("MILP Solver sedang mencari solusi matematis terbaik (Global Optimum)..."):
+                with st.spinner("MILP Solver sedang mencari solusi matematis terbaik..."):
                     best_squad_ids, starting_ids_milp, captain_id_milp = run_realistic_milp(
                         elements, current_ids, bank_money, free_transfers, use_chip_wildcard=use_wildcard
                     )
@@ -353,27 +377,23 @@ if bootstrap:
                 
             st.divider()
 
-            # --- IDENTIFIKASI REKOMENDASI TRANSFER ---
             transfers_out_ids = list(set(current_ids) - set(best_squad_ids))
             transfers_in_ids = list(set(best_squad_ids) - set(current_ids))
             
             t_out_df = elements[elements['id'].isin(transfers_out_ids)]
             t_in_df = elements[elements['id'].isin(transfers_in_ids)]
 
-            # -----------------------------------------------------------------
-            # OUTPUT 1: REKOMENDASI TRANSFER & CHIP
-            # -----------------------------------------------------------------
             st.subheader(f"1. 🔄 Hasil Rekomendasi Transfer ({opt_type})")
             
             num_transfers = len(transfers_in_ids)
             hit_cost = 0 if use_wildcard else max(0, num_transfers - free_transfers) * 4
             
             if use_wildcard:
-                st.success(f"🎉 **WILDCARD AKTIF:** Berhasil melakukan perombakan {num_transfers} pemain tanpa penalti Hit (0 Pts Penalty).")
+                st.success(f"🎉 **WILDCARD AKTIF:** Perombakan {num_transfers} pemain tanpa penalti Hit.")
             elif num_transfers == 0:
-                st.success("✅ **Saran Transfer:** **TIDAK ADA TRANSFER (0 Transfer)**. Kombinasi tim eksisting Anda sudah optimal.")
+                st.success("✅ **Saran Transfer:** **TIDAK ADA TRANSFER (0 Transfer)**.")
             else:
-                st.success(f"✅ **Saran Transfer:** {num_transfers} Transfer direkomendasikan (Penalti Hit: -{hit_cost} Pts).")
+                st.success(f"✅ **Saran Transfer:** {num_transfers} Transfer (Penalti Hit: -{hit_cost} Pts).")
 
             col_t1, col_t2 = st.columns(2)
             with col_t1:
@@ -383,9 +403,6 @@ if bootstrap:
                 st.markdown("🟢 **Pemain Masuk (Transfer In):**")
                 st.dataframe(t_in_df[["web_name", "team_name", "now_cost", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
 
-            # -----------------------------------------------------------------
-            # OUTPUT 2: STARTING LINEUP & KAPTEN
-            # -----------------------------------------------------------------
             st.subheader("2. 🏆 Starting Lineup & Pemilihan Kapten")
             
             captain = starting_xi.iloc[0]
