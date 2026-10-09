@@ -7,7 +7,7 @@ import pulp
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 # ============================================================
-# FPL OPTIMIZER v2.2 (Fast Engine) — Multi-Period MILP & ML
+# FPL OPTIMIZER v2.2 — Robust Engine (Multi-Period MILP & ML)
 # ============================================================
 
 st.set_page_config(page_title="FPL Optimizer v2.2", layout="wide")
@@ -236,9 +236,10 @@ def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
     return pd.DataFrame(records)
 
 # -----------------------------------------------------------------------------
-# 3. MULTI-PERIOD MILP SOLVER (STRICT TYPE CASTING FIX)
+# 3. MULTI-PERIOD MILP SOLVER (STRICT PULP NAME SANITIZATION)
 # -----------------------------------------------------------------------------
 def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, horizon_gws, picks_data):
+    # Konversi ketat ke native python int
     all_ids = [int(x) for x in df["id"].unique()]
     gws = [int(x) for x in horizon_gws]
     current_ids = [int(x) for x in current_ids]
@@ -264,17 +265,17 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
 
     prob = pulp.LpProblem("FPL_MultiPeriod_v2_2", pulp.LpMaximize)
 
-    # String Formatting Eksplisit untuk Variabel PuLP
-    squad = {(i, t): pulp.LpVariable(f"s_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    xi    = {(i, t): pulp.LpVariable(f"x_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    cap   = {(i, t): pulp.LpVariable(f"c_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    vc    = {(i, t): pulp.LpVariable(f"v_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    tin   = {(i, t): pulp.LpVariable(f"in_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    tout  = {(i, t): pulp.LpVariable(f"out_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    # Nama variabel PuLP di-sanitize menjadi String Murni
+    squad = {(i, t): pulp.LpVariable(f"s_{str(i)}_g{str(t)}", cat="Binary") for i in all_ids for t in gws}
+    xi    = {(i, t): pulp.LpVariable(f"x_{str(i)}_g{str(t)}", cat="Binary") for i in all_ids for t in gws}
+    cap   = {(i, t): pulp.LpVariable(f"c_{str(i)}_g{str(t)}", cat="Binary") for i in all_ids for t in gws}
+    vc    = {(i, t): pulp.LpVariable(f"v_{str(i)}_g{str(t)}", cat="Binary") for i in all_ids for t in gws}
+    tin   = {(i, t): pulp.LpVariable(f"in_{str(i)}_g{str(t)}", cat="Binary") for i in all_ids for t in gws}
+    tout  = {(i, t): pulp.LpVariable(f"out_{str(i)}_g{str(t)}", cat="Binary") for i in all_ids for t in gws}
     
-    ft_avail = {t: pulp.LpVariable(f"ft_avail_g{t}", lowBound=1, upBound=5, cat="Integer") for t in gws}
-    ft_used  = {t: pulp.LpVariable(f"ft_used_g{t}", lowBound=0, upBound=5, cat="Integer") for t in gws}
-    hits     = {t: pulp.LpVariable(f"hits_g{t}", lowBound=0, cat="Integer") for t in gws}
+    ft_avail = {t: pulp.LpVariable(f"ft_avail_g{str(t)}", lowBound=1, upBound=5, cat="Integer") for t in gws}
+    ft_used  = {t: pulp.LpVariable(f"ft_used_g{str(t)}", lowBound=0, upBound=5, cat="Integer") for t in gws}
+    hits     = {t: pulp.LpVariable(f"hits_g{str(t)}", lowBound=0, cat="Integer") for t in gws}
 
     cur_set = set(current_ids)
     
