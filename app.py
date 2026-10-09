@@ -252,7 +252,7 @@ def solve_milp(df, current_ids, bank, free_transfers, active_chip, horizon_gws):
     price = dict(zip(df["id"], df["now_cost"] / 10.0))
     team  = dict(zip(df["id"], df["team"]))
     pos   = dict(zip(df["id"], df["element_type"]))
-    gw1_xp = dict(zip(df["id"], df["xP_gw1"]))
+    gw1_xp = dict(zip(df["id"], df["xP_h1"]))
     horizon_xp = dict(zip(df["id"], df["xP_horizon"]))  # sum GW2..N (0 jika hanya 1 GW)
 
     all_ids = list(df["id"])
@@ -403,11 +403,13 @@ xp_long = predict_xp_all(model, latest, fix_by_team, horizon_gws, teams, element
 
 # pivot xP per GW
 xp_pivot = xp_long.pivot_table(index="id", columns="gw", values="xP", aggfunc="sum").fillna(0.0)
-xp_pivot.columns = [f"xP_gw{c}" for c in xp_pivot.columns]
-elements = elements.merge(xp_pivot, left_on="id", right_index=True, how="left").fillna({"xP_gw1": 0})
+xp_pivot = xp_pivot.reindex(columns=sorted(xp_pivot.columns))
+# normalisasi posisional: GW berikutnya -> xP_h1, GW+2 -> xP_h2, dst.
+xp_pivot.columns = [f"xP_h{k+1}" for k in range(xp_pivot.shape[1])]
+elements = elements.merge(xp_pivot, left_on="id", right_index=True, how="left").fillna({"xP_h1": 0})
 for c in xp_pivot.columns:
     elements[c] = elements[c].fillna(0.0)
-elements["xP_horizon"] = elements[[c for c in xp_pivot.columns if c != "xP_gw1"]].sum(axis=1)
+elements["xP_horizon"] = elements[[c for c in xp_pivot.columns if c != "xP_h1"]].sum(axis=1)
 
 # --- Peringatan DGW / BGW (kunci chip BB & TC) ---
 dgw_teams = sorted({team_names[t] for (t, gw) in dgw_set if gw == next_gw})
@@ -431,15 +433,15 @@ if len(current_df) == 15:
     st.caption(f"Total harga skuad: £{cur_cost:.1f}m | Bank: £{bank:.1f}m")
     st.dataframe(
         current_df[["web_name", "team_name", "element_type", "now_cost", "status",
-                    "xP_gw1"]].rename(columns={
+                    "xP_h1"]].rename(columns={
             "web_name": "Pemain", "team_name": "Klub",
             "element_type": "Posisi", "now_cost": "Harga (£0.1m)",
-            "status": "Status", "xP_gw1": f"xP GW{next_gw}"}),
+            "status": "Status", "xP_h1": f"xP GW{next_gw}"}),
         use_container_width=True, hide_index=True)
 
     if st.button("🎯 JALANKAN OPTIMASI (MILP)", type="primary", use_container_width=True):
         with st.spinner("MILP solver mencari solusi optimal..."):
-            df_opt = elements[elements["xP_gw1"] > 0].copy()
+            df_opt = elements[elements["xP_h1"] > 0].copy()
             res = solve_milp(df_opt, current_df["id"].tolist(), bank, ft,
                              active_chip, horizon_gws[:horizon])
 
@@ -463,12 +465,12 @@ if len(current_df) == 15:
 
         c1, c2 = st.columns(2)
         c1.markdown("🔴 **Keluar:**")
-        c1.dataframe(t_out[["web_name", "team_name", "xP_gw1"]].rename(
-            columns={"web_name": "Pemain", "team_name": "Klub", "xP_gw1": "xP"}),
+        c1.dataframe(t_out[["web_name", "team_name", "xP_h1"]].rename(
+            columns={"web_name": "Pemain", "team_name": "Klub", "xP_h1": "xP"}),
             use_container_width=True, hide_index=True)
         c2.markdown("🟢 **Masuk:**")
-        c2.dataframe(t_in[["web_name", "team_name", "xP_gw1"]].rename(
-            columns={"web_name": "Pemain", "team_name": "Klub", "xP_gw1": "xP"}),
+        c2.dataframe(t_in[["web_name", "team_name", "xP_h1"]].rename(
+            columns={"web_name": "Pemain", "team_name": "Klub", "xP_h1": "xP"}),
             use_container_width=True, hide_index=True)
 
         # Kapten/VC: prioritas pemain DGW & xP tertinggi
@@ -476,10 +478,10 @@ if len(current_df) == 15:
         cap_df = elements[elements["id"].isin(res["captain"])].iloc[0]
         vc_df = elements[elements["id"].isin(res["vice"])].iloc[0]
         bench_df = elements[elements["id"].isin(set(res["squad"]) - set(res["xi"]))] \
-            .sort_values("xP_gw1", ascending=False)
-        cap_pts = cap_df["xP_gw1"] * (3.0 if active_chip == "Triple Captain" else 2.0)
-        net_pts = xi_df["xP_gw1"].sum() + cap_df["xP_gw1"] - res["hit"] \
-            + (bench_df["xP_gw1"].sum() if active_chip == "Bench Boost" else 0)
+            .sort_values("xP_h1", ascending=False)
+        cap_pts = cap_df["xP_h1"] * (3.0 if active_chip == "Triple Captain" else 2.0)
+        net_pts = xi_df["xP_h1"].sum() + cap_df["xP_h1"] - res["hit"] \
+            + (bench_df["xP_h1"].sum() if active_chip == "Bench Boost" else 0)
 
         st.subheader("2. 🏆 Starting XI, Kapten & Proyksi")
         k1, k2, k3 = st.columns(3)
@@ -492,22 +494,22 @@ if len(current_df) == 15:
         st.markdown(f"**Starting XI ({POS}-wise):**")
         st.dataframe(
             xi_df.assign(Posisi=xi_df["element_type"].map(POS))
-                 .sort_values(["Posisi", "xP_gw1"], ascending=[True, False])
-                 [["web_name", "team_name", "Posisi", "status", "xP_gw1"]]
+                 .sort_values(["Posisi", "xP_h1"], ascending=[True, False])
+                 [["web_name", "team_name", "Posisi", "status", "xP_h1"]]
                  .rename(columns={"web_name": "Pemain", "team_name": "Klub",
-                                  "status": "Status", "xP_gw1": "xP"}),
+                                  "status": "Status", "xP_h1": "xP"}),
             use_container_width=True, hide_index=True)
         st.markdown("**Bench:**")
         st.dataframe(
             bench_df.assign(Posisi=bench_df["element_type"].map(POS))
-                    [["web_name", "team_name", "Posisi", "xP_gw1"]]
+                    [["web_name", "team_name", "Posisi", "xP_h1"]]
                     .rename(columns={"web_name": "Pemain", "team_name": "Klub",
-                                     "xP_gw1": "xP"}),
+                                     "xP_h1": "xP"}),
             use_container_width=True, hide_index=True)
 
         if horizon > 1:
             st.subheader(f"3. 🔭 Proyksi xP per GW (horizon {horizon} GW)")
-            show = xi_df[["web_name"] + [f"xP_gw{g}" for g in horizon_gws[:horizon]]] \
+            show = xi_df[["web_name"] + [f"xP_h{k+1}" for k in range(horizon)]] \
                 .rename(columns={"web_name": "Pemain"})
             st.dataframe(show, use_container_width=True, hide_index=True)
 
