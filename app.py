@@ -396,7 +396,8 @@ model = train_model(hist_feat)
 st.success(f"✅ Model dilatih dari **{len(hist):,} baris data per-gameweek** "
            f"(xG, xA, ICT, menit, BPS, home/away, kekuatan lawan).")
 
-latest = latest_player_state(hist, elements)
+# fitur rolling/opp hanya ada di hist_feat (bukan hist mentah)
+latest = latest_player_state(hist_feat, elements)
 fix_by_team, dgw_set, bgw_set = upcoming_fixtures_by_team(fixtures, horizon_gws)
 xp_long = predict_xp_all(model, latest, fix_by_team, horizon_gws, teams, elements)
 
