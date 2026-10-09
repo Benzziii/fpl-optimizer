@@ -2,446 +2,511 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import random
+from concurrent.futures import ThreadPoolExecutor
 import pulp
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 
-# Config Halaman
-st.set_page_config(page_title="FPL Optimizer & ML Predictor", layout="wide")
-st.title("⚽ FPL Optimizer: MILP (Pure Solver) & Genetic Algorithm")
+# ============================================================
+# FPL OPTIMIZER v2.0 — Two-Stage Model (ML Predictor + MILP)
+# Stage 1: xP Predictor (Gradient Boosting dari histori GW)
+# Stage 2: MILP Solver (transfer logic, hit cost, chip, horizon)
+# ============================================================
+
+st.set_page_config(page_title="FPL Optimizer v2.0", layout="wide")
+st.title("⚽ FPL Optimizer v2.0 — ML Predictor & MILP Solver")
+
+API = "https://fantasy.premierleague.com/api"
 
 # -----------------------------------------------------------------------------
-# 1. FETCH DATA FROM FPL API
+# 1. DATA FETCHING
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600)
-def fetch_fpl_bootstrap():
-    url = "https://fantasy.premierleague.com/api/bootstrap-static/"
-    res = requests.get(url)
-    return res.json() if res.status_code == 200 else None
+@st.cache_data(ttl=1800)
+def fetch_bootstrap():
+    r = requests.get(f"{API}/bootstrap-static/", timeout=30)
+    return r.json() if r.status_code == 200 else None
 
-def fetch_user_fpl(entry_id):
-    bootstrap = fetch_fpl_bootstrap()
-    if not bootstrap:
+@st.cache_data(ttl=1800)
+def fetch_fixtures():
+    r = requests.get(f"{API}/fixtures/", timeout=30)
+    return r.json() if r.status_code == 200 else None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_element_summaries(player_ids):
+    """Ambil histori per-gameweek semua pemain (parallel, cached)."""
+    def get(pid):
+        try:
+            r = requests.get(f"{API}/element-summary/{pid}/", timeout=15)
+            return pid, (r.json() if r.status_code == 200 else None)
+        except Exception:
+            return pid, None
+    out = {}
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for pid, data in ex.map(get, player_ids):
+            out[pid] = data
+    return out
+
+@st.cache_data(ttl=600)
+def fetch_user_entry(entry_id):
+    """Ambil skuad, bank, free transfer, dan chip dari entry ID FPL."""
+    b = fetch_bootstrap()
+    if not b:
         return None, "Gagal terhubung ke API FPL."
-    
-    current_gw = [gw['id'] for gw in bootstrap['events'] if gw['is_current'] or gw['is_next']][0]
-    
-    # 1. Fetch Picks
-    picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw}/picks/"
-    res = requests.get(picks_url)
-    if res.status_code != 200 and current_gw > 1:
-        picks_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/event/{current_gw - 1}/picks/"
-        res = requests.get(picks_url)
-        
-    if res.status_code != 200:
-        return None, "ID FPL tidak ditemukan."
-        
-    data = res.json()
-    bank = data.get("entry_history", {}).get("bank", 0) / 10.0
-    player_ids = [p["element"] for p in data.get("picks", [])]
-    
-    # 2. Fetch History untuk cek Chip yang SUDAH DIPAKAI
-    used_chips = []
-    hist_url = f"https://fantasy.premierleague.com/api/entry/{entry_id}/history/"
-    res_hist = requests.get(hist_url)
-    if res_hist.status_code == 200:
-        chips_data = res_hist.json().get("chips", [])
-        for c in chips_data:
-            # Map nama chip API ke nama tampilan
-            c_name = c.get("name")
-            if c_name == "wildcard": used_chips.append("Wildcard")
-            elif c_name == "freehit": used_chips.append("Free Hit")
-            elif c_name == "bboost": used_chips.append("Bench Boost")
-            elif c_name == "3xc": used_chips.append("Triple Captain")
+    nxt = [e["id"] for e in b["events"] if e["is_next"]]
+    cur = [e["id"] for e in b["events"] if e["is_current"]]
+    gw = (nxt or cur)[0]
 
-    # Hitung Chip yang MASIH TERSEDIA
-    all_possible_chips = ["Wildcard", "Free Hit", "Bench Boost", "Triple Captain"]
-    available_chips = [c for c in all_possible_chips if c not in used_chips]
-    
+    r = requests.get(f"{API}/entry/{entry_id}/event/{gw}/picks/", timeout=20)
+    if r.status_code != 200 and gw > 1:
+        r = requests.get(f"{API}/entry/{entry_id}/event/{gw-1}/picks/", timeout=20)
+    if r.status_code != 200:
+        return None, "Entry ID tidak ditemukan / belum ada picks."
+    picks = r.json()
+
+    r2 = requests.get(f"{API}/entry/{entry_id}/", timeout=20)
+    profile = r2.json() if r2.status_code == 200 else {}
+    chip_this_gw = profile.get("active_chip")  # chip yg sedang aktif pekan ini
+
+    # Chip yang sudah dipakai (musim ini) — cek history
+    used = []
+    r3 = requests.get(f"{API}/entry/{entry_id}/history/", timeout=20)
+    if r3.status_code == 200:
+        for c in r3.json().get("chips", []):
+            m = {"wildcard": "Wildcard", "freehit": "Free Hit",
+                 "bboost": "Bench Boost", "3xc": "Triple Captain"}
+            if c.get("name") in m:
+                used.append(m[c["name"]])
+    if chip_this_gw:  # chip aktif tapi mungkin belum masuk history
+        m = {"wildcard": "Wildcard", "freehit": "Free Hit",
+             "bboost": "Bench Boost", "3xc": "Triple Captain"}
+        nm = m.get(chip_this_gw)
+        if nm and nm not in used:
+            used.append(nm)
+
+    eh = picks.get("entry_history", {})
     return {
-        "player_ids": player_ids, 
-        "bank": bank, 
-        "available_chips": available_chips,
-        "used_chips": used_chips
-    }, "Data skuad & status chip berhasil diimpor!"
+        "player_ids": [p["element"] for p in picks.get("picks", [])],
+        "bank": eh.get("bank", 0) / 10.0,
+        "ft": eh.get("event_transfers", 0),
+        "ft_cost": eh.get("event_transfers_cost", 0) / 10.0,
+        "used_chips": used,
+        "active_chip": chip_this_gw,
+    }, f"OK — Data GW{gw} diimpor."
 
 # -----------------------------------------------------------------------------
-# 2. MACHINE LEARNING ENGINE (PREDICT XP VIA RANDOM FOREST)
+# 2. FEATURE ENGINEERING (dok: Variabel 1 & 2 — Performa + Konteks Fixture)
 # -----------------------------------------------------------------------------
-def predict_player_xp(df):
-    df_feat = df.copy()
-    
-    df_feat['form'] = pd.to_numeric(df_feat['form'], errors='coerce').fillna(0)
-    df_feat['ict_index'] = pd.to_numeric(df_feat['ict_index'], errors='coerce').fillna(0)
-    df_feat['points_per_game'] = pd.to_numeric(df_feat['points_per_game'], errors='coerce').fillna(0)
-    df_feat['selected_by_percent'] = pd.to_numeric(df_feat['selected_by_percent'], errors='coerce').fillna(0)
-    df_feat['ep_next'] = pd.to_numeric(df_feat['ep_next'], errors='coerce').fillna(0)
-    
-    X = df_feat[['form', 'ict_index', 'points_per_game', 'selected_by_percent', 'ep_next']]
-    
-    y_target = (
-        df_feat['form'] * 0.35 + 
-        df_feat['ict_index'] * 0.05 + 
-        df_feat['points_per_game'] * 0.35 + 
-        df_feat['ep_next'] * 0.25
-    ) * np.where(df_feat['status'] == 'a', 1.0, 0.15)
-    
-    rf = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
-    rf.fit(X, y_target)
-    
-    df['predicted_xP'] = np.round(rf.predict(X), 2)
+POS = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+
+def build_history_df(summaries):
+    rows = []
+    for pid, s in summaries.items():
+        if s and s.get("history"):
+            for h in s["history"]:
+                rows.append(h)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["element"] = df["element"].astype(int)
+    df = df.sort_values(["element", "round"]).reset_index(drop=True)
+    num_cols = ["minutes", "total_points", "ict_index", "bonus", "bps",
+                "expected_goal_involvements", "expected_goals", "expected_assists",
+                "expected_goals_conceded", "goals_scored", "assists", "clean_sheets",
+                "saves", "starts"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     return df
 
+def add_rolling_features(hist, teams):
+    """Fitur lag (hanya info yang tersedia SEBELUM gameweek dimainkan)."""
+    g = hist.groupby("element", group_keys=False)
+
+    for w in (3, 6):
+        hist[f"r{w}_xgi"]  = g["expected_goal_involvements"].apply(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+        hist[f"r{w}_ict"]  = g["ict_index"].apply(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+        hist[f"r{w}_min"]  = g["minutes"].apply(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+        hist[f"r{w}_pts"]  = g["total_points"].apply(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+        hist[f"r{w}_xgc"]  = g["expected_goals_conceded"].apply(
+            lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+
+    # Poin per game musim berjalan (expanding, shift 1)
+    hist["season_ppg"] = g["total_points"].apply(
+        lambda s: s.shift(1).expanding(min_periods=1).mean())
+
+    # Kekuatan lawan (FDR berbasis team strength resmi FPL)
+    def opp_str(row, kind):
+        t = teams.get(int(row["opponent_team"]), {})
+        loc = "away" if row["was_home"] else "home"  # lawan main di mana
+        return float(t.get(f"strength_{kind}_{loc}", t.get("strength", 3)))
+    hist["opp_att"] = hist.apply(lambda r: opp_str(r, "attack"), axis=1)
+    hist["opp_def"] = hist.apply(lambda r: opp_str(r, "defence"), axis=1)
+    return hist
+
+FEATURES = ["pos", "was_home", "opp_att", "opp_def",
+            "r3_xgi", "r6_xgi", "r3_ict", "r6_ict",
+            "r3_min", "r6_min", "r3_pts", "season_ppg", "r3_xgc"]
+
+@st.cache_resource(show_spinner=False)
+def train_model(train_df):
+    df = train_df.dropna(subset=["total_points"]).copy()
+    X, y = df[FEATURES], df["total_points"]
+    model = HistGradientBoostingRegressor(
+        max_iter=300, learning_rate=0.06, max_depth=6,
+        l2_regularization=1.0, random_state=42)
+    model.fit(X, y)
+    return model
+
+def latest_player_state(hist, elements):
+    """Fitur terbaru tiap pemain untuk prediksi GW berikutnya."""
+    idx = hist.groupby("element")["round"].idxmax()
+    latest = hist.loc[idx, ["element"] + [c for c in FEATURES if c != "pos"]].copy()
+    latest = latest.merge(
+        elements[["id", "element_type", "status", "chance_of_playing_this_round",
+                  "penalties_order", "direct_freekicks_order",
+                  "corners_and_indirect_freekicks_order", "ep_next"]],
+        left_on="element", right_on="id", how="left")
+    latest["pos"] = latest["element_type"]
+    # NaN rolling (pemain baru/tanpa histori) → isi 0
+    for c in ["r3_xgi", "r6_xgi", "r3_ict", "r6_ict", "r3_min", "r6_min",
+              "r3_pts", "season_ppg", "r3_xgc"]:
+        latest[c] = latest[c].fillna(0.0)
+    # Set-piece status (dok: variabel 1) → bonus xP kecil
+    latest["setpiece_bonus"] = 0.0
+    latest.loc[latest["penalties_order"] == 1, "setpiece_bonus"] += 0.6
+    latest.loc[latest["direct_freekicks_order"] == 1, "setpiece_bonus"] += 0.2
+    latest.loc[latest["corners_and_indirect_freekicks_order"] == 1, "setpiece_bonus"] += 0.2
+    return latest
+
+def upcoming_fixtures_by_team(fixtures, gw_list):
+    """fixture difficulty per tim per GW + deteksi DGW/BGW (dok: variabel 2)."""
+    out = {}
+    dgw, bgw = {}, {}
+    for f in fixtures:
+        if f.get("finished") or f["event"] not in gw_list:
+            continue
+        for team, home in ((f["team_h"], True), (f["team_a"], False)):
+            out.setdefault((team, f["event"]), []).append(
+                {"home": home, "opp": f["team_a"] if home else f["team_h"]})
+    for gw in gw_list:
+        for team in set(t for t, _ in out.keys()):
+            n = len(out.get((team, gw), []))
+            if n == 2:
+                dgw[(team, gw)] = True
+            elif n == 0:
+                bgw[(team, gw)] = True
+    return out, dgw, bgw
+
+def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
+    """Prediksi xP per pemain per GW. DGW = jumlah xP dua laga."""
+    team_of = dict(zip(elements["id"], elements["team"]))
+    price = dict(zip(elements["id"], elements["now_cost"] / 10.0))
+    cop = dict(zip(elements["id"], elements["chance_of_playing_this_round"]))
+    status = dict(zip(elements["id"], elements["status"]))
+    epn = dict(zip(elements["id"], pd.to_numeric(elements["ep_next"], errors="coerce")))
+
+    records = []
+    for _, p in latest.iterrows():
+        pid, t = int(p["element"]), team_of.get(int(p["element"]))
+        # Faktor ketersediaan (dok: variabel 3)
+        avail = 1.0
+        if status.get(pid) in ("i", "s", "u"):
+            avail = float(cop.get(pid) or 0) / 100.0
+        elif cop.get(pid) not in (None, 0):
+            avail = float(cop.get(pid)) / 100.0
+        # Faktor menit: rotasi (r3_min rendah -> xP diturunkan proporsional)
+        min_factor = min(1.0, (p["r3_min"] or 0) / 65.0) if (p["r3_min"] or 0) > 0 else 0.35
+
+        for gw in gw_list:
+            fx = fix_by_team.get((t, gw), [])
+            if not fx:  # BGW
+                records.append({"id": pid, "gw": gw, "xP": 0.0, "n_fixture": 0})
+                continue
+            xp_match = 0.0
+            for f in fx:
+                opp = teams.get(f["opp"], {})
+                loc = "away" if f["home"] else "home"
+                row = p.copy()
+                row["was_home"] = 1.0 if f["home"] else 0.0
+                row["opp_att"] = float(opp.get(f"strength_attack_{loc}", opp.get("strength", 3)))
+                row["opp_def"] = float(opp.get(f"strength_defence_{loc}", opp.get("strength", 3)))
+                xp_match += max(0.0, float(model.predict(row[FEATURES].to_frame().T)[0]))
+            xp = (xp_match + p["setpiece_bonus"] * len(fx)) * avail * min_factor
+            # Blend ringan dengan ep_next resmi FPL sebagai sanity anchor
+            e = epn.get(pid)
+            if e and np.isfinite(e):
+                xp = 0.85 * xp + 0.15 * float(e) * avail * len(fx)
+            records.append({"id": pid, "gw": gw, "xP": round(xp, 2), "n_fixture": len(fx)})
+    return pd.DataFrame(records)
+
 # -----------------------------------------------------------------------------
-# 3. OPTIMIZER ENGINES (MILP & GENETIC ALGORITHM)
+# 3. STAGE 2: MILP SOLVER (dok: Optimization Solver)
+#    - Transfer in/out dengan biaya hit (-4) vs free transfer
+#    - Chip: Wildcard/Free Hit (0 hit), Bench Boost (+xP bench), Triple Captain (3x)
+#    - Horizon: transfer dinilai dari total xP beberapa GW ke depan
 # -----------------------------------------------------------------------------
+def solve_milp(df, current_ids, bank, free_transfers, active_chip, horizon_gws):
+    price = dict(zip(df["id"], df["now_cost"] / 10.0))
+    team  = dict(zip(df["id"], df["team"]))
+    pos   = dict(zip(df["id"], df["element_type"]))
+    gw1_xp = dict(zip(df["id"], df["xP_gw1"]))
+    horizon_xp = dict(zip(df["id"], df["xP_horizon"]))  # sum GW2..N (0 jika hanya 1 GW)
 
-# --- A. MILP SOLVER (PULP SAFE INITIALIZATION) ---
-def run_realistic_milp(df, current_ids, bank, free_transfers, use_chip_wildcard=False):
-    all_pids = df['id'].tolist()
-    
-    price_dict = dict(zip(df['id'], df['now_cost'] / 10.0))
-    xp_dict = dict(zip(df['id'], df['predicted_xP']))
-    pos_dict = dict(zip(df['id'], df['element_type'])) # 1: GKP, 2: DEF, 3: MID, 4: FWD
-    team_dict = dict(zip(df['id'], df['team']))
-    
-    current_cost = sum(price_dict[i] for i in current_ids if i in price_dict)
-    max_budget = current_cost + bank
+    all_ids = list(df["id"])
+    cur_cost = sum(price[i] for i in current_ids if i in price)
+    cur_set = set(current_ids)
 
-    prob = pulp.LpProblem("FPL_Optimization", pulp.LpMaximize)
+    prob = pulp.LpProblem("FPL_v2", pulp.LpMaximize)
+    squad = {i: pulp.LpVariable(f"s_{i}", cat="Binary") for i in all_ids}
+    xi    = {i: pulp.LpVariable(f"x_{i}", cat="Binary") for i in all_ids}
+    cap   = {i: pulp.LpVariable(f"c_{i}", cat="Binary") for i in all_ids}
+    vc    = {i: pulp.LpVariable(f"v_{i}", cat="Binary") for i in all_ids}
+    tin   = {i: pulp.LpVariable(f"in_{i}", cat="Binary") for i in all_ids}
+    tout  = {i: pulp.LpVariable(f"out_{i}", cat="Binary") for i in all_ids}
 
-    # Decision Variables (Inisialisasi Aman tanpa AttributeError)
-    squad_vars = {i: pulp.LpVariable(f"Squad_{i}", cat='Binary') for i in all_pids}
-    start_vars = {i: pulp.LpVariable(f"Start_{i}", cat='Binary') for i in all_pids}
-    cap_vars   = {i: pulp.LpVariable(f"Captain_{i}", cat='Binary') for i in all_pids}
+    for i in all_ids:
+        c = 1 if i in cur_set else 0
+        prob += tin[i] >= squad[i] - c
+        prob += tout[i] >= c - squad[i]
+        prob += tin[i] + tout[i] <= 1
+        prob += xi[i] <= squad[i]
+        prob += cap[i] <= xi[i]
+        prob += vc[i] <= xi[i]
+        prob += cap[i] + vc[i] <= 1
 
-    transfer_out = {i: pulp.LpVariable(f"TransferOut_{i}", cat='Binary') for i in all_pids}
-    transfer_in  = {i: pulp.LpVariable(f"TransferIn_{i}", cat='Binary') for i in all_pids}
+    n_trans = pulp.lpSum([tin[i] for i in all_ids])
+    prob += n_trans == pulp.lpSum([tout[i] for i in all_ids])
+    prob += pulp.lpSum([squad[i] for i in all_ids]) == 15
+    prob += pulp.lpSum([xi[i] for i in all_ids]) == 11
+    prob += pulp.lpSum([cap[i] for i in all_ids]) == 1
+    prob += pulp.lpSum([vc[i] for i in all_ids]) == 1
 
-    # Hit Penalty Logic
-    if use_chip_wildcard:
-        hit_penalty = 0
+    # Biaya: harga beli = now_cost (harga jual tidak dimodelkan — catatan UI)
+    prob += pulp.lpSum([price[i] * squad[i] for i in all_ids]) <= cur_cost + bank + 0.001
+
+    for p, n in ((1, 2), (2, 5), (3, 5), (4, 3)):
+        prob += pulp.lpSum([squad[i] for i in all_ids if pos[i] == p]) == n
+    prob += pulp.lpSum([xi[i] for i in all_ids if pos[i] == 1]) == 1
+    prob += pulp.lpSum([xi[i] for i in all_ids if pos[i] == 2]) >= 3
+    prob += pulp.lpSum([xi[i] for i in all_ids if pos[i] == 3]) >= 2
+    prob += pulp.lpSum([xi[i] for i in all_ids if pos[i] == 4]) >= 1
+
+    for t in set(team.values()):
+        prob += pulp.lpSum([squad[i] for i in all_ids if team[i] == t]) <= 3
+
+    # Hit cost: -4 poin per transfer melebihi kuota FT, KECUALI WC/FH aktif
+    no_hit = active_chip in ("Wildcard", "Free Hit")
+    extra = pulp.LpVariable("extra_tr", lowBound=0, cat="Integer")
+    if not no_hit:
+        prob += extra >= n_trans - free_transfers
+        hit_penalty = 4.0 * extra
     else:
-        num_transfers = pulp.lpSum([transfer_in[i] for i in all_pids])
-        extra_transfers = pulp.LpVariable("ExtraTransfers", lowBound=0, cat='Integer')
-        prob += extra_transfers >= num_transfers - free_transfers
-        hit_penalty = 4.0 * extra_transfers
+        hit_penalty = 0.0
 
-    # Objective: Maximize xP
-    total_xp = (
-        pulp.lpSum([xp_dict[i] * start_vars[i] for i in all_pids]) + 
-        pulp.lpSum([xp_dict[i] * cap_vars[i] for i in all_pids]) - 
-        hit_penalty
+    # Objective: xP GW1 (lineup + kapten) + xP horizon skuad (GW2..N)
+    is_bb   = active_chip == "Bench Boost"
+    is_tc   = active_chip == "Triple Captain"
+    cap_mult = 2.0 + (1.0 if is_tc else 0.0)   # kapten biasa 2x, TC 3x
+    obj = (
+        pulp.lpSum([gw1_xp[i] * xi[i] for i in all_ids])
+        + pulp.lpSum([gw1_xp[i] * cap[i] for i in all_ids]) * (cap_mult - 1)
+        + (pulp.lpSum([gw1_xp[i] * (squad[i] - xi[i]) for i in all_ids]) if is_bb else 0)
+        + pulp.lpSum([horizon_xp[i] * squad[i] for i in all_ids]) * 0.7
+        - hit_penalty
     )
-    prob += total_xp
+    prob += obj
+    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=60))
 
-    # Constraints
-    prob += pulp.lpSum([squad_vars[i] for i in all_pids]) == 15
-    prob += pulp.lpSum([start_vars[i] for i in all_pids]) == 11
-    prob += pulp.lpSum([cap_vars[i] for i in all_pids]) == 1
-
-    for i in all_pids:
-        prob += start_vars[i] <= squad_vars[i]
-        prob += cap_vars[i] <= start_vars[i]
-
-    prob += pulp.lpSum([price_dict[i] * squad_vars[i] for i in all_pids]) <= max_budget
-
-    # Squad Position Constraints
-    prob += pulp.lpSum([squad_vars[i] for i in all_pids if pos_dict[i] == 1]) == 2
-    prob += pulp.lpSum([squad_vars[i] for i in all_pids if pos_dict[i] == 2]) == 5
-    prob += pulp.lpSum([squad_vars[i] for i in all_pids if pos_dict[i] == 3]) == 5
-    prob += pulp.lpSum([squad_vars[i] for i in all_pids if pos_dict[i] == 4]) == 3
-
-    # Starting XI Position Constraints
-    prob += pulp.lpSum([start_vars[i] for i in all_pids if pos_dict[i] == 1]) == 1
-    prob += pulp.lpSum([start_vars[i] for i in all_pids if pos_dict[i] == 2]) >= 3
-    prob += pulp.lpSum([start_vars[i] for i in all_pids if pos_dict[i] == 3]) >= 2
-    prob += pulp.lpSum([start_vars[i] for i in all_pids if pos_dict[i] == 4]) >= 1
-
-    # Max 3 Players per Team
-    teams = set(team_dict.values())
-    for t in teams:
-        prob += pulp.lpSum([squad_vars[i] for i in all_pids if team_dict[i] == t]) <= 3
-
-    # Transfer Logic
-    current_set = set(current_ids)
-    for i in all_pids:
-        is_current = 1 if i in current_set else 0
-        prob += squad_vars[i] == is_current - transfer_out[i] + transfer_in[i]
-
-    solver = pulp.PULP_CBC_CMD(msg=False)
-    prob.solve(solver)
-
-    best_squad_ids = [i for i in all_pids if pulp.value(squad_vars[i]) == 1]
-    starting_ids = [i for i in all_pids if pulp.value(start_vars[i]) == 1]
-    captain_id = [i for i in all_pids if pulp.value(cap_vars[i]) == 1][0]
-
-    return best_squad_ids, starting_ids, captain_id
-
-
-# --- B. GENETIC ALGORITHM OPTIMIZER ---
-def run_genetic_algorithm(df, current_ids, bank, free_transfers, use_chip_wildcard=False, pop_size=80, generations=50):
-    all_ids = df['id'].tolist()
-    id_to_price = dict(zip(df['id'], df['now_cost'] / 10.0))
-    id_to_xp = dict(zip(df['id'], df['predicted_xP']))
-    id_to_pos = dict(zip(df['id'], df['element_type']))
-    id_to_team = dict(zip(df['id'], df['team']))
-
-    current_cost = sum(id_to_price[i] for i in current_ids if i in id_to_price)
-    max_budget = current_cost + bank
-
-    def is_valid_squad(squad_ids):
-        if len(squad_ids) != 15: return False
-        if sum(id_to_price[i] for i in squad_ids) > max_budget: return False
-        
-        pos_counts = {1:0, 2:0, 3:0, 4:0}
-        for i in squad_ids: pos_counts[id_to_pos[i]] += 1
-        if pos_counts != {1:2, 2:5, 3:5, 4:3}: return False
-        
-        team_counts = {}
-        for i in squad_ids:
-            t = id_to_team[i]
-            team_counts[t] = team_counts.get(t, 0) + 1
-            if team_counts[t] > 3: return False
-            
-        return True
-
-    def calculate_fitness(squad_ids):
-        transfers_made = len(set(squad_ids) - set(current_ids))
-        if use_chip_wildcard:
-            hit_penalty = 0
-        else:
-            extra_transfers = max(0, transfers_made - free_transfers)
-            hit_penalty = extra_transfers * 4.0
-            
-        total_xp = sum(id_to_xp[i] for i in squad_ids)
-        return total_xp - hit_penalty
-
-    population = []
-    if is_valid_squad(current_ids): population.append(current_ids)
-
-    attempts = 0
-    while len(population) < pop_size and attempts < 2000:
-        attempts += 1
-        num_swaps = random.randint(0, 10 if use_chip_wildcard else 4)
-        candidate = list(current_ids)
-        
-        for _ in range(num_swaps):
-            if candidate:
-                candidate.pop(random.randint(0, len(candidate) - 1))
-            new_pick = random.choice(all_ids)
-            if new_pick not in candidate: candidate.append(new_pick)
-                
-        if is_valid_squad(candidate): population.append(candidate)
-
-    if not population: population = [current_ids]
-
-    for _ in range(generations):
-        population = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)
-        survivors = population[:pop_size // 2]
-        
-        children = []
-        while len(survivors) + len(children) < pop_size:
-            p1, p2 = random.sample(survivors, 2)
-            split = random.randint(1, 14)
-            child = list(set(p1[:split] + p2[split:]))
-            
-            missing = [i for i in all_ids if i not in child]
-            random.shuffle(missing)
-            while len(child) < 15 and missing: child.append(missing.pop())
-                
-            if random.random() < 0.35:
-                m_idx = random.randint(0, 14)
-                rand_p = random.choice(all_ids)
-                if rand_p not in child: child[m_idx] = rand_p
-                    
-            if is_valid_squad(child): children.append(child)
-                
-        population = survivors + children
-
-    best_squad = sorted(population, key=lambda ind: calculate_fitness(ind), reverse=True)[0]
-    return best_squad
-
-def select_starting_xi(squad_df):
-    gkps = squad_df[squad_df['element_type'] == 1].sort_values(by="predicted_xP", ascending=False)
-    defs = squad_df[squad_df['element_type'] == 2].sort_values(by="predicted_xP", ascending=False)
-    mids = squad_df[squad_df['element_type'] == 3].sort_values(by="predicted_xP", ascending=False)
-    fwds = squad_df[squad_df['element_type'] == 4].sort_values(by="predicted_xP", ascending=False)
-    
-    starting_ids = []
-    starting_ids.append(gkps.iloc[0]['id'])
-    starting_ids.extend(defs.iloc[:3]['id'].tolist())
-    starting_ids.extend(mids.iloc[:2]['id'].tolist())
-    starting_ids.extend(fwds.iloc[:1]['id'].tolist())
-    
-    remaining_outfield = squad_df[
-        (~squad_df['id'].isin(starting_ids)) & 
-        (squad_df['element_type'] != 1)
-    ].sort_values(by="predicted_xP", ascending=False)
-    
-    starting_ids.extend(remaining_outfield.iloc[:4]['id'].tolist())
-    
-    starting_xi = squad_df[squad_df['id'].isin(starting_ids)].sort_values(by="predicted_xP", ascending=False)
-    bench = squad_df[~squad_df['id'].isin(starting_ids)].sort_values(by="predicted_xP", ascending=False)
-    
-    return starting_xi, bench
+    sol = lambda d: [i for i in all_ids if pulp.value(d[i]) == 1]
+    return {
+        "squad": sol(squad), "xi": sol(xi), "captain": sol(cap), "vice": sol(vc),
+        "net_xP": pulp.value(obj),
+        "n_transfers": int(pulp.value(n_trans)),
+        "hit": 0 if no_hit else int(pulp.value(extra)) * 4,
+    }
 
 # -----------------------------------------------------------------------------
-# 4. STREAMLIT INTERFACE
+# 4. STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.sidebar.header("📥 Import Data FPL")
-fpl_id = st.sidebar.text_input("Entry ID FPL:", value="", placeholder="Contoh: 123456")
+fpl_id = st.sidebar.text_input("Entry ID FPL (opsional):", placeholder="Contoh: 123456")
+st.session_state.setdefault("user_ids", [])
+st.session_state.setdefault("bank", 0.5)
+st.session_state.setdefault("ft", 1)
+st.session_state.setdefault("used_chips", [])
 
-if "user_ids" not in st.session_state: st.session_state["user_ids"] = []
-if "bank" not in st.session_state: st.session_state["bank"] = 0.5
-if "available_chips" not in st.session_state: st.session_state["available_chips"] = ["Wildcard", "Bench Boost", "Triple Captain"]
-if "used_chips" not in st.session_state: st.session_state["used_chips"] = []
+with st.spinner("Mengunduh data FPL (bootstrap, fixtures, histori semua pemain)..."):
+    bootstrap = fetch_bootstrap()
+    fixtures = fetch_fixtures()
 
-bootstrap = fetch_fpl_bootstrap()
+if not bootstrap or fixtures is None:
+    st.error("Gagal terhubung ke API Fantasy Premier League. Coba beberapa saat lagi.")
+    st.stop()
 
-if bootstrap:
-    elements = pd.DataFrame(bootstrap["elements"])
-    teams = {t["id"]: t["name"] for t in bootstrap["teams"]}
-    elements["team_name"] = elements["team"].map(teams)
-    
-    # ML Prediction
-    elements = predict_player_xp(elements)
-    
-    if st.sidebar.button("Import Skuad FPL") and fpl_id:
-        u_data, msg = fetch_user_fpl(fpl_id)
-        if u_data:
-            st.session_state["user_ids"] = u_data["player_ids"]
-            st.session_state["bank"] = u_data["bank"]
-            st.session_state["available_chips"] = u_data["available_chips"]
-            st.session_state["used_chips"] = u_data["used_chips"]
-            st.sidebar.success(msg)
+elements = pd.DataFrame(bootstrap["elements"])
+teams = {t["id"]: t for t in bootstrap["teams"]}
+team_names = {t["id"]: t["name"] for t in bootstrap["teams"]}
+elements["team_name"] = elements["team"].map(team_names)
+
+events = bootstrap["events"]
+done_gws = [e["id"] for e in events if e["is_current"]]
+next_gw = [e["id"] for e in events if e["is_next"]][0]
+horizon_gws = [next_gw + k for k in range(3) if next_gw + k <= max(e["id"] for e in events)]
+
+if st.sidebar.button("🔽 Import Skuad Saya") and fpl_id:
+    data, msg = fetch_user_entry(fpl_id.strip())
+    if data:
+        st.session_state.user_ids = data["player_ids"]
+        st.session_state.bank = data["bank"]
+        st.session_state.ft = max(1, min(5, data["ft"] + 1))
+        st.session_state.used_chips = data["used_chips"]
+        st.sidebar.success(msg)
+        if data["used_chips"]:
+            st.sidebar.info(f"Chip terpakai musim ini: {', '.join(data['used_chips'])}")
+    else:
+        st.sidebar.error(msg)
+
+bank = st.sidebar.number_input("Sisa budget bank (£m):", 0.0, 30.0,
+                               float(st.session_state.bank), 0.1)
+ft = st.sidebar.number_input("Free transfer tersedia:", 0, 5, int(st.session_state.ft))
+used_chips = st.session_state.used_chips
+all_chips = ["Wildcard", "Free Hit", "Bench Boost", "Triple Captain"]
+avail_chips = [c for c in all_chips if c not in used_chips]
+active_chip = st.sidebar.selectbox("⚡ Chip aktif pekan ini:", ["Tanpa Chip"] + avail_chips)
+horizon = st.sidebar.slider("Horizon perencanaan (GW ke depan):", 1, 3, 1)
+st.sidebar.caption("Model: Gradient Boosting + MILP (solusi matematis optimal)")
+
+# --- Stage 1: bangun & latih model ---
+with st.spinner("⏳ Membangun dataset histori & melatih model ML (±30–60 detik pertama kali)..."):
+    summaries = fetch_element_summaries(elements["id"].tolist())
+    hist = build_history_df(summaries)
+
+if hist.empty:
+    st.error("Histori pemain kosong — musim mungkin belum dimulai.")
+    st.stop()
+
+model = train_model(add_rolling_features(hist.copy(), teams))
+st.success(f"✅ Model dilatih dari **{len(hist):,} baris data per-gameweek** "
+           f"(xG, xA, ICT, menit, BPS, home/away, kekuatan lawan).")
+
+latest = latest_player_state(hist, elements)
+fix_by_team, dgw_set, bgw_set = upcoming_fixtures_by_team(fixtures, horizon_gws)
+xp_long = predict_xp_all(model, latest, fix_by_team, horizon_gws, teams, elements)
+
+# pivot xP per GW
+xp_pivot = xp_long.pivot_table(index="id", columns="gw", values="xP", aggfunc="sum").fillna(0.0)
+xp_pivot.columns = [f"xP_gw{c}" for c in xp_pivot.columns]
+elements = elements.merge(xp_pivot, left_on="id", right_index=True, how="left").fillna({"xP_gw1": 0})
+for c in xp_pivot.columns:
+    elements[c] = elements[c].fillna(0.0)
+elements["xP_horizon"] = elements[[c for c in xp_pivot.columns if c != "xP_gw1"]].sum(axis=1)
+
+# --- Peringatan DGW / BGW (kunci chip BB & TC) ---
+dgw_teams = sorted({team_names[t] for (t, gw) in dgw_set if gw == next_gw})
+bgw_teams = sorted({team_names[t] for (t, gw) in bgw_set if gw == next_gw})
+if dgw_teams:
+    st.info(f"🔁 **DGW{next_gw}** — main 2x: {', '.join(dgw_teams)} "
+            f"→ kandidat kuat **Triple Captain / Bench Boost**.")
+if bgw_teams:
+    st.warning(f"🚫 **BGW{next_gw}** — tidak main: {', '.join(bgw_teams)} "
+               f"→ hindari beli pemain tim ini; **Free Hit** layak dipertimbangkan.")
+
+# --- Input skuad ---
+st.subheader("📋 Skuad Saat Ini")
+default_names = elements[elements["id"].isin(st.session_state.user_ids)]["web_name"].tolist()
+sel_names = st.multiselect("Pilih 15 pemain Anda (atau import otomatis via Entry ID):",
+                           elements["web_name"].tolist(), default=default_names)
+current_df = elements[elements["web_name"].isin(sel_names)].copy()
+
+if len(current_df) == 15:
+    cur_cost = (current_df["now_cost"] / 10.0).sum()
+    st.caption(f"Total harga skuad: £{cur_cost:.1f}m | Bank: £{bank:.1f}m")
+    st.dataframe(
+        current_df[["web_name", "team_name", "element_type", "now_cost", "status",
+                    "xP_gw1"]].rename(columns={
+            "web_name": "Pemain", "team_name": "Klub",
+            "element_type": "Posisi", "now_cost": "Harga (£0.1m)",
+            "status": "Status", "xP_gw1": f"xP GW{next_gw}"}),
+        use_container_width=True, hide_index=True)
+
+    if st.button("🎯 JALANKAN OPTIMASI (MILP)", type="primary", use_container_width=True):
+        with st.spinner("MILP solver mencari solusi optimal..."):
+            df_opt = elements[elements["xP_gw1"] > 0].copy()
+            res = solve_milp(df_opt, current_df["id"].tolist(), bank, ft,
+                             active_chip, horizon_gws[:horizon])
+
+        out_ids = set(current_df["id"]) - set(res["squad"])
+        in_ids = set(res["squad"]) - set(current_df["id"])
+        t_out = elements[elements["id"].isin(out_ids)]
+        t_in = elements[elements["id"].isin(in_ids)]
+
+        st.divider()
+        st.subheader("1. 🔄 Rekomendasi Transfer")
+        if active_chip in ("Wildcard", "Free Hit"):
+            st.success(f"🎉 **{active_chip} AKTIF** — {res['n_transfers']} perubahan, **tanpa penalti**.")
+        elif res["n_transfers"] == 0:
+            st.success("✅ **Tidak perlu transfer** — skuad saat ini sudah optimal.")
         else:
-            st.sidebar.error(msg)
-            
-    bank_money = st.sidebar.number_input("Budget Sisa di Bank (£m):", min_value=0.0, max_value=20.0, value=float(st.session_state["bank"]), step=0.1)
-    free_transfers = st.sidebar.number_input("Free Transfer Tersedia:", min_value=1, max_value=5, value=1)
-    
-    chips_available = st.sidebar.multiselect(
-        "Chip Tersedia:", 
-        options=["Wildcard", "Free Hit", "Bench Boost", "Triple Captain"], 
-        default=st.session_state["available_chips"]
-    )
-    
-    if st.session_state["used_chips"]:
-        st.sidebar.info(f"ℹ️ **Chip Sudah Dipakai:** {', '.join(st.session_state['used_chips'])}")
+            free_used = min(res["n_transfers"], ft)
+            paid = res["n_transfers"] - free_used
+            st.success(f"✅ **{res['n_transfers']} transfer** "
+                       f"({free_used} gratis, {paid} berbayar → **-{res['hit']} poin**). "
+                       f"Total xP setelah hit tetap lebih tinggi.")
 
-    active_chip = st.sidebar.selectbox(
-        "⚡ Eksekusi Chip Pekan Ini:",
-        options=["Tanpa Chip"] + chips_available,
-        index=0
-    )
+        c1, c2 = st.columns(2)
+        c1.markdown("🔴 **Keluar:**")
+        c1.dataframe(t_out[["web_name", "team_name", "xP_gw1"]].rename(
+            columns={"web_name": "Pemain", "team_name": "Klub", "xP_gw1": "xP"}),
+            use_container_width=True, hide_index=True)
+        c2.markdown("🟢 **Masuk:**")
+        c2.dataframe(t_in[["web_name", "team_name", "xP_gw1"]].rename(
+            columns={"web_name": "Pemain", "team_name": "Klub", "xP_gw1": "xP"}),
+            use_container_width=True, hide_index=True)
 
-    use_wildcard = (active_chip == "Wildcard")
+        # Kapten/VC: prioritas pemain DGW & xP tertinggi
+        xi_df = elements[elements["id"].isin(res["xi"])].copy()
+        cap_df = elements[elements["id"].isin(res["captain"])].iloc[0]
+        vc_df = elements[elements["id"].isin(res["vice"])].iloc[0]
+        bench_df = elements[elements["id"].isin(set(res["squad"]) - set(res["xi"]))] \
+            .sort_values("xP_gw1", ascending=False)
+        cap_pts = cap_df["xP_gw1"] * (3.0 if active_chip == "Triple Captain" else 2.0)
+        net_pts = xi_df["xP_gw1"].sum() + cap_df["xP_gw1"] - res["hit"] \
+            + (bench_df["xP_gw1"].sum() if active_chip == "Bench Boost" else 0)
 
-    st.subheader("📋 Skuad Terdaftar (15 Pemain)")
-    default_selected = elements[elements["id"].isin(st.session_state["user_ids"])]["web_name"].tolist()
-    
-    selected_names = st.multiselect("Daftar Pemain Anda Saat Ini:", options=elements["web_name"].tolist(), default=default_selected)
-    current_df = elements[elements["web_name"].isin(selected_names)].copy()
+        st.subheader("2. 🏆 Starting XI, Kapten & Proyksi")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("👑 Kapten" + (" (3x!)" if active_chip == "Triple Captain" else ""),
+                  cap_df["web_name"], f"{cap_pts:.1f} poin")
+        k2.metric("🎖️ Vice-Kapten", vc_df["web_name"], f"{vc_df['xP_gw1']:.1f} poin")
+        k3.metric(f"📊 Proyksi GW{next_gw} (setelah hit)", f"{net_pts:.1f} poin",
+                  delta=f"-{res['hit']} hit" if res["hit"] else "tanpa hit")
 
-    if not current_df.empty:
+        st.markdown(f"**Starting XI ({POS}-wise):**")
         st.dataframe(
-            current_df[["web_name", "team_name", "element_type", "now_cost", "status", "form", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0),
-            use_container_width=True
-        )
+            xi_df.assign(Posisi=xi_df["element_type"].map(POS))
+                 .sort_values(["Posisi", "xP_gw1"], ascending=[True, False])
+                 [["web_name", "team_name", "Posisi", "status", "xP_gw1"]]
+                 .rename(columns={"web_name": "Pemain", "team_name": "Klub",
+                                  "status": "Status", "xP_gw1": "xP"}),
+            use_container_width=True, hide_index=True)
+        st.markdown("**Bench:**")
+        st.dataframe(
+            bench_df.assign(Posisi=bench_df["element_type"].map(POS))
+                    [["web_name", "team_name", "Posisi", "xP_gw1"]]
+                    .rename(columns={"web_name": "Pemain", "team_name": "Klub",
+                                     "xP_gw1": "xP"}),
+            use_container_width=True, hide_index=True)
 
-        col_opt1, col_opt2 = st.columns(2)
-        run_milp = col_opt1.button("🎯 JALANKAN OPTIMASI REALISTIS (MILP Solver)", use_container_width=True)
-        run_ga = col_opt2.button("🧬 JALANKAN OPTIMASI GENETIC ALGORITHM", use_container_width=True)
+        if horizon > 1:
+            st.subheader(f"3. 🔭 Proyksi xP per GW (horizon {horizon} GW)")
+            show = xi_df[["web_name"] + [f"xP_gw{g}" for g in horizon_gws[:horizon]]] \
+                .rename(columns={"web_name": "Pemain"})
+            st.dataframe(show, use_container_width=True, hide_index=True)
 
-        if run_milp or run_ga:
-            current_ids = current_df["id"].tolist()
-            
-            if run_milp:
-                with st.spinner("MILP Solver sedang mencari solusi matematis terbaik..."):
-                    best_squad_ids, starting_ids_milp, captain_id_milp = run_realistic_milp(
-                        elements, current_ids, bank_money, free_transfers, use_chip_wildcard=use_wildcard
-                    )
-                    final_squad_df = elements[elements['id'].isin(best_squad_ids)].copy()
-                    starting_xi = elements[elements['id'].isin(starting_ids_milp)].sort_values(by="predicted_xP", ascending=False)
-                    bench = final_squad_df[~final_squad_df['id'].isin(starting_ids_milp)].sort_values(by="predicted_xP", ascending=False)
-                    opt_type = "MILP Solver (Presisi Tinggi)"
-            else:
-                with st.spinner("Genetic Algorithm sedang mensimulasikan evolusi kombinasi transfer..."):
-                    best_squad_ids = run_genetic_algorithm(
-                        elements, current_ids, bank_money, free_transfers, use_chip_wildcard=use_wildcard
-                    )
-                    final_squad_df = elements[elements['id'].isin(best_squad_ids)].copy()
-                    starting_xi, bench = select_starting_xi(final_squad_df)
-                    opt_type = "Genetic Algorithm"
-                
-            st.divider()
-
-            transfers_out_ids = list(set(current_ids) - set(best_squad_ids))
-            transfers_in_ids = list(set(best_squad_ids) - set(current_ids))
-            
-            t_out_df = elements[elements['id'].isin(transfers_out_ids)]
-            t_in_df = elements[elements['id'].isin(transfers_in_ids)]
-
-            st.subheader(f"1. 🔄 Hasil Rekomendasi Transfer ({opt_type})")
-            
-            num_transfers = len(transfers_in_ids)
-            hit_cost = 0 if use_wildcard else max(0, num_transfers - free_transfers) * 4
-            
-            if use_wildcard:
-                st.success(f"🎉 **WILDCARD AKTIF:** Perombakan {num_transfers} pemain tanpa penalti Hit.")
-            elif num_transfers == 0:
-                st.success("✅ **Saran Transfer:** **TIDAK ADA TRANSFER (0 Transfer)**.")
-            else:
-                st.success(f"✅ **Saran Transfer:** {num_transfers} Transfer (Penalti Hit: -{hit_cost} Pts).")
-
-            col_t1, col_t2 = st.columns(2)
-            with col_t1:
-                st.markdown("🔴 **Pemain Keluar (Transfer Out):**")
-                st.dataframe(t_out_df[["web_name", "team_name", "now_cost", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
-            with col_t2:
-                st.markdown("🟢 **Pemain Masuk (Transfer In):**")
-                st.dataframe(t_in_df[["web_name", "team_name", "now_cost", "predicted_xP"]].assign(Harga=lambda x: x["now_cost"]/10.0), use_container_width=True)
-
-            st.subheader("2. 🏆 Starting Lineup & Pemilihan Kapten")
-            
-            captain = starting_xi.iloc[0]
-            vice_captain = starting_xi.iloc[1]
-            
-            raw_total_pts = starting_xi['predicted_xP'].sum() + captain['predicted_xP']
-            net_expected_pts = raw_total_pts - hit_cost
-            
-            col_cap1, col_cap2, col_cap3 = st.columns(3)
-            with col_cap1:
-                st.metric("👑 CAPTAIN", f"{captain['web_name']}", f"{captain['predicted_xP'] * 2} xP")
-            with col_cap2:
-                st.metric("🎖️ VICE-CAPTAIN", f"{vice_captain['web_name']}", f"{vice_captain['predicted_xP']} xP")
-            with col_cap3:
-                st.metric("📊 NET PROYEKSI POIN (Setelah Hit)", f"{round(net_expected_pts, 2)} Pts")
-
-            st.markdown("---")
-            st.markdown("### 🟢 Starting Eleven (11 Pemain Utama)")
-            st.dataframe(
-                starting_xi[["web_name", "team_name", "element_type", "form", "status", "predicted_xP"]]
-                .rename(columns={
-                    "web_name": "Nama Pemain", 
-                    "team_name": "Klub", 
-                    "element_type": "Posisi (1:GKP, 2:DEF, 3:MID, 4:FWD)",
-                    "predicted_xP": "Expected Points (xP)"
-                }),
-                use_container_width=True
-            )
-
-            st.markdown("### 🪑 Bench (4 Pemain Cadangan)")
-            st.dataframe(
-                bench[["web_name", "team_name", "element_type", "form", "status", "predicted_xP"]]
-                .rename(columns={
-                    "web_name": "Nama Pemain", 
-                    "team_name": "Klub", 
-                    "element_type": "Posisi",
-                    "predicted_xP": "Expected Points (xP)"
-                }),
-                use_container_width=True
-            )
+        st.caption("Catatan: harga jual memakai now_cost (perubahan harga jual-beli FPL tidak dimodelkan); "
+                   "xP = model GBM dari histori GW + konteks fixture; cek injury manual sebelum deadline.")
 else:
-    st.error("Gagal terhubung ke API Fantasy Premier League.")
+    st.info(f"Pilih tepat **15 pemain** (sekarang: {len(current_df)}). Atau import via Entry ID di sidebar.")
