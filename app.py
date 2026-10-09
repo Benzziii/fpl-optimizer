@@ -30,7 +30,6 @@ def fetch_fixtures():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_element_summaries_fast(active_player_ids):
-    """Mengunduh histori pemain aktif secara efisien untuk menghindari throttling API."""
     def get(pid):
         try:
             r = requests.get(f"{API}/element-summary/{pid}/", timeout=5)
@@ -85,12 +84,12 @@ def fetch_user_entry(entry_id):
     for p in picks.get("picks", []):
         sp = p.get("selling_price", 0) / 10.0
         pp = p.get("purchase_price", 0) / 10.0
-        picks_data[p["element"]] = {"selling_price": sp, "purchase_price": pp}
+        picks_data[int(p["element"])] = {"selling_price": float(sp), "purchase_price": float(pp)}
 
     return {
-        "player_ids": [p["element"] for p in picks.get("picks", [])],
-        "bank": eh.get("bank", 0) / 10.0,
-        "ft": max(1, min(5, (eh.get("event_transfers", 0) or 0) + 1)),
+        "player_ids": [int(p["element"]) for p in picks.get("picks", [])],
+        "bank": float(eh.get("bank", 0)) / 10.0,
+        "ft": max(1, min(5, int(eh.get("event_transfers", 0) or 0) + 1)),
         "used_chips": used,
         "active_chip": chip_this_gw,
         "picks_data": picks_data
@@ -195,10 +194,10 @@ def upcoming_fixtures_by_team(fixtures, gw_list):
     return out, dgw, bgw
 
 def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
-    team_of = dict(zip(elements["id"], elements["team"]))
-    cop = dict(zip(elements["id"], elements["chance_of_playing_this_round"]))
-    status = dict(zip(elements["id"], elements["status"]))
-    epn = dict(zip(elements["id"], pd.to_numeric(elements["ep_next"], errors="coerce")))
+    team_of = dict(zip(elements["id"].astype(int), elements["team"].astype(int)))
+    cop = dict(zip(elements["id"].astype(int), elements["chance_of_playing_this_round"]))
+    status = dict(zip(elements["id"].astype(int), elements["status"]))
+    epn = dict(zip(elements["id"].astype(int), pd.to_numeric(elements["ep_next"], errors="coerce")))
 
     records = []
     for _, p in latest.iterrows():
@@ -214,6 +213,7 @@ def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
         min_factor = min(1.0, xmins / 90.0)
 
         for gw in gw_list:
+            gw = int(gw)
             fx = fix_by_team.get((t, gw), [])
             if not fx:
                 records.append({"id": pid, "gw": gw, "xP": 0.0, "n_fixture": 0})
@@ -236,7 +236,7 @@ def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
     return pd.DataFrame(records)
 
 # -----------------------------------------------------------------------------
-# 3. MULTI-PERIOD MILP SOLVER (FIXED TYPES)
+# 3. MULTI-PERIOD MILP SOLVER (STRICT TYPE CASTING FIX)
 # -----------------------------------------------------------------------------
 def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, horizon_gws, picks_data):
     all_ids = [int(x) for x in df["id"].unique()]
@@ -264,16 +264,17 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
 
     prob = pulp.LpProblem("FPL_MultiPeriod_v2_2", pulp.LpMaximize)
 
-    squad = {(i, t): pulp.LpVariable(f"s_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
-    xi    = {(i, t): pulp.LpVariable(f"x_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
-    cap   = {(i, t): pulp.LpVariable(f"c_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
-    vc    = {(i, t): pulp.LpVariable(f"v_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
-    tin   = {(i, t): pulp.LpVariable(f"in_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
-    tout  = {(i, t): pulp.LpVariable(f"out_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
+    # String Formatting Eksplisit untuk Variabel PuLP
+    squad = {(i, t): pulp.LpVariable(f"s_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    xi    = {(i, t): pulp.LpVariable(f"x_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    cap   = {(i, t): pulp.LpVariable(f"c_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    vc    = {(i, t): pulp.LpVariable(f"v_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    tin   = {(i, t): pulp.LpVariable(f"in_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    tout  = {(i, t): pulp.LpVariable(f"out_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
     
-    ft_avail = {t: pulp.LpVariable(f"ft_avail_g{int(t)}", lowBound=1, upBound=5, cat="Integer") for t in gws}
-    ft_used  = {t: pulp.LpVariable(f"ft_used_g{int(t)}", lowBound=0, upBound=5, cat="Integer") for t in gws}
-    hits     = {t: pulp.LpVariable(f"hits_g{int(t)}", lowBound=0, cat="Integer") for t in gws}
+    ft_avail = {t: pulp.LpVariable(f"ft_avail_g{t}", lowBound=1, upBound=5, cat="Integer") for t in gws}
+    ft_used  = {t: pulp.LpVariable(f"ft_used_g{t}", lowBound=0, upBound=5, cat="Integer") for t in gws}
+    hits     = {t: pulp.LpVariable(f"hits_g{t}", lowBound=0, cat="Integer") for t in gws}
 
     cur_set = set(current_ids)
     
@@ -379,7 +380,7 @@ team_names = {t["id"]: t["name"] for t in bootstrap["teams"]}
 elements["team_name"] = elements["team"].map(team_names)
 
 events = bootstrap["events"]
-next_gw = [e["id"] for e in events if e["is_next"]][0]
+next_gw = int([e["id"] for e in events if e["is_next"]][0])
 horizon_gws = [next_gw + k for k in range(3) if next_gw + k <= max(e["id"] for e in events)]
 
 if st.sidebar.button("🔽 Import Skuad Saya") and fpl_id:
