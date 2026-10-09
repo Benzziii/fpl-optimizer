@@ -388,7 +388,11 @@ if hist.empty:
     st.error("Histori pemain kosong — musim mungkin belum dimulai.")
     st.stop()
 
-model = train_model(add_rolling_features(hist.copy(), teams))
+hist_feat = add_rolling_features(hist.copy(), teams)
+hist_feat = hist_feat.merge(elements[["id", "element_type"]],
+                            left_on="element", right_on="id", how="left")
+hist_feat["pos"] = hist_feat["element_type"]
+model = train_model(hist_feat)
 st.success(f"✅ Model dilatih dari **{len(hist):,} baris data per-gameweek** "
            f"(xG, xA, ICT, menit, BPS, home/away, kekuatan lawan).")
 
