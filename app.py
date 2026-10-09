@@ -7,7 +7,7 @@ import pulp
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 # ============================================================
-# FPL OPTIMIZER v2.2 — Advanced Multi-Period MILP & ML
+# FPL OPTIMIZER v2.2 (Fast Engine) — Multi-Period MILP & ML
 # ============================================================
 
 st.set_page_config(page_title="FPL Optimizer v2.2", layout="wide")
@@ -16,7 +16,7 @@ st.title("⚽ FPL Optimizer v2.2 — Multi-Period MILP & Refined ML")
 API = "https://fantasy.premierleague.com/api"
 
 # -----------------------------------------------------------------------------
-# 1. DATA FETCHING
+# 1. OPTIMIZED DATA FETCHING (FAST & FILTERED)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_bootstrap():
@@ -28,17 +28,19 @@ def fetch_fixtures():
     r = requests.get(f"{API}/fixtures/", timeout=30)
     return r.json() if r.status_code == 200 else None
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_element_summaries(player_ids):
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_element_summaries_fast(active_player_ids):
+    """Mengunduh histori pemain aktif secara efisien untuk menghindari throttling API."""
     def get(pid):
         try:
-            r = requests.get(f"{API}/element-summary/{pid}/", timeout=15)
+            r = requests.get(f"{API}/element-summary/{pid}/", timeout=5)
             return pid, (r.json() if r.status_code == 200 else None)
         except Exception:
             return pid, None
+
     out = {}
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        for pid, data in ex.map(get, player_ids):
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for pid, data in ex.map(get, active_player_ids):
             out[pid] = data
     return out
 
@@ -79,7 +81,6 @@ def fetch_user_entry(entry_id):
 
     eh = picks.get("entry_history", {})
     
-    # Simpan Selling & Purchase Price Aktual
     picks_data = {}
     for p in picks.get("picks", []):
         sp = p.get("selling_price", 0) / 10.0
@@ -89,7 +90,7 @@ def fetch_user_entry(entry_id):
     return {
         "player_ids": [p["element"] for p in picks.get("picks", [])],
         "bank": eh.get("bank", 0) / 10.0,
-        "ft": max(1, min(5, (eh.get("event_transfers", 0) or 0) + 1)), # Aturan Baru: Maks 5 FT
+        "ft": max(1, min(5, (eh.get("event_transfers", 0) or 0) + 1)),
         "used_chips": used,
         "active_chip": chip_this_gw,
         "picks_data": picks_data
@@ -209,7 +210,6 @@ def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
         elif cop.get(pid) not in (None, 0):
             avail = float(cop.get(pid)) / 100.0
             
-        # Expected Minutes (xMins) Refinement
         xmins = p["r3_min"] if p["r3_min"] > 0 else 25.0
         min_factor = min(1.0, xmins / 90.0)
 
@@ -239,15 +239,14 @@ def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
 # 3. MULTI-PERIOD MILP SOLVER
 # -----------------------------------------------------------------------------
 def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, horizon_gws, picks_data):
-    all_ids = list(df["id"])
+    all_ids = list(df["id"].unique())
     gws = horizon_gws
-    N = len(gws)
-
-    now_cost = dict(zip(df["id"], df["now_cost"] / 10.0))
-    team = dict(zip(df["id"], df["team"]))
-    pos = dict(zip(df["id"], df["element_type"]))
     
-    # Perhitungan Selling Price Aktual FPL
+    el_df = df.drop_duplicates("id").set_index("id")
+    now_cost = (el_df["now_cost"] / 10.0).to_dict()
+    team = el_df["team"].to_dict()
+    pos = el_df["element_type"].to_dict()
+    
     sell_price = {}
     for i in all_ids:
         nc = now_cost[i]
@@ -258,14 +257,12 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
         else:
             sell_price[i] = nc
 
-    # Grid xP: xp_dict[id][gw]
     xp_dict = {i: {} for i in all_ids}
     for _, r in df.iterrows():
         xp_dict[r["id"]][r["gw"]] = r["xP"]
 
     prob = pulp.LpProblem("FPL_MultiPeriod_v2_2", pulp.LpMaximize)
 
-    # Variabel Keputusan per GW (t)
     squad = {(i, t): pulp.LpVariable(f"s_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
     xi    = {(i, t): pulp.LpVariable(f"x_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
     cap   = {(i, t): pulp.LpVariable(f"c_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
@@ -273,16 +270,13 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
     tin   = {(i, t): pulp.LpVariable(f"in_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
     tout  = {(i, t): pulp.LpVariable(f"out_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
     
-    # Free Transfers & Hits per GW
     ft_avail = {t: pulp.LpVariable(f"ft_avail_g{t}", lowBound=1, upBound=5, cat="Integer") for t in gws}
     ft_used  = {t: pulp.LpVariable(f"ft_used_g{t}", lowBound=0, upBound=5, cat="Integer") for t in gws}
     hits     = {t: pulp.LpVariable(f"hits_g{t}", lowBound=0, cat="Integer") for t in gws}
 
-    # State GW 0
     cur_set = set(current_ids)
     
     for idx_t, t in enumerate(gws):
-        # Transisi Skuad (squad[i, t] = squad[i, t-1] + tin - tout)
         for i in all_ids:
             prev_in = 1 if (idx_t == 0 and i in cur_set) else (squad[(i, gws[idx_t-1])] if idx_t > 0 else 0)
             prob += squad[(i, t)] == prev_in + tin[(i, t)] - tout[(i, t)]
@@ -298,7 +292,6 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
         prob += pulp.lpSum([cap[(i, t)] for i in all_ids]) == 1
         prob += pulp.lpSum([vc[(i, t)] for i in all_ids]) == 1
 
-        # Pembatasan Posisi & Tim
         for p, n in ((1, 2), (2, 5), (3, 5), (4, 3)):
             prob += pulp.lpSum([squad[(i, t)] for i in all_ids if pos[i] == p]) == n
         prob += pulp.lpSum([xi[(i, t)] for i in all_ids if pos[i] == 1]) == 1
@@ -309,16 +302,13 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
         for tm in set(team.values()):
             prob += pulp.lpSum([squad[(i, t)] for i in all_ids if team[i] == tm]) <= 3
 
-        # Logika Free Transfer & Hits
         if idx_t == 0:
             prob += ft_avail[t] == free_transfers
         else:
             prev_t = gws[idx_t - 1]
-            # Aturan FPL: FT tersisa disimpan + 1 FT baru (Maksimal 5)
             prob += ft_avail[t] <= ft_avail[prev_t] - ft_used[prev_t] + 1
             prob += ft_avail[t] <= 5
 
-        # Chip Hanya Berlaku di GW1 untuk Simulasi Ini
         chip_t = active_chip if idx_t == 0 else "Tanpa Chip"
         if chip_t in ("Wildcard", "Free Hit"):
             prob += hits[t] == 0
@@ -328,20 +318,16 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
             prob += ft_used[t] <= n_trans
             prob += hits[t] >= n_trans - ft_used[t]
 
-    # Budget Constraint (GW1)
     cur_squad_value = sum(sell_price.get(i, now_cost[i]) for i in current_ids if i in sell_price)
     max_budget = cur_squad_value + bank
     prob += pulp.lpSum([now_cost[i] * squad[(i, gws[0])] for i in all_ids]) <= max_budget + 0.001
 
-    # Objective Function Multi-GW
     total_obj = []
     for idx_t, t in enumerate(gws):
         chip_t = active_chip if idx_t == 0 else "Tanpa Chip"
         is_bb = chip_t == "Bench Boost"
         is_tc = chip_t == "Triple Captain"
         cap_mult = 3.0 if is_tc else 2.0
-        
-        # Discount Factor untuk GW Murni Mendatang (GW2: 0.85, GW3: 0.72)
         decay = 1.0 if idx_t == 0 else (0.85 ** idx_t)
 
         gw_xp = (
@@ -412,9 +398,14 @@ avail_chips = [c for c in ["Wildcard", "Free Hit", "Bench Boost", "Triple Captai
 active_chip = st.sidebar.selectbox("⚡ Chip aktif pekan ini:", ["Tanpa Chip"] + avail_chips)
 horizon = st.sidebar.slider("Horizon perencanaan (GW ke depan):", 1, 3, 2)
 
-with st.spinner("Melatih model ML & menghitung proyeksi xP..."):
-    summaries = fetch_element_summaries(elements["id"].tolist())
+# FETCH CEPAT: Filter hanya pemain aktif
+with st.spinner("⚡ Mengambil data histori pemain aktif (Fast Engine)..."):
+    active_elements = elements[(elements["total_points"] > 0) | (elements["minutes"] > 0)]
+    active_ids = active_elements["id"].tolist()
+    
+    summaries = fetch_element_summaries_fast(active_ids)
     hist = build_history_df(summaries)
+    
     hist_feat = add_rolling_features(hist.copy(), teams)
     hist_feat = hist_feat.merge(elements[["id", "element_type"]], left_on="element", right_on="id", how="left")
     hist_feat["pos"] = hist_feat["element_type"]
@@ -424,7 +415,6 @@ latest = latest_player_state(hist_feat, elements)
 fix_by_team, dgw_set, bgw_set = upcoming_fixtures_by_team(fixtures, horizon_gws)
 xp_long = predict_xp_all(model, latest, fix_by_team, horizon_gws, teams, elements)
 
-# Dataframe gabungan xP
 df_opt_full = xp_long.merge(elements[["id", "now_cost", "team", "element_type", "web_name", "status"]], on="id")
 
 st.subheader("📋 Skuad Saat Ini")
@@ -465,7 +455,6 @@ if len(current_df) == 15:
         c2.markdown("🟢 **Masuk:**")
         c2.dataframe(t_in[["web_name", "team_name", "now_cost"]].assign(Harga=t_in["now_cost"]/10.0)[["web_name", "team_name", "Harga"]].rename(columns={"web_name": "Pemain", "team_name": "Klub"}), use_container_width=True, hide_index=True)
 
-        # Merge xP GW1
         gw1_xp_df = xp_long[xp_long["gw"] == next_gw].set_index("id")["xP"]
         elements["xP_GW1"] = elements["id"].map(gw1_xp_df).fillna(0.0)
 
