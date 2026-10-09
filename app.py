@@ -236,22 +236,23 @@ def predict_xp_all(model, latest, fix_by_team, gw_list, teams, elements):
     return pd.DataFrame(records)
 
 # -----------------------------------------------------------------------------
-# 3. MULTI-PERIOD MILP SOLVER
+# 3. MULTI-PERIOD MILP SOLVER (FIXED TYPES)
 # -----------------------------------------------------------------------------
 def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, horizon_gws, picks_data):
-    all_ids = list(df["id"].unique())
-    gws = horizon_gws
+    all_ids = [int(x) for x in df["id"].unique()]
+    gws = [int(x) for x in horizon_gws]
+    current_ids = [int(x) for x in current_ids]
     
     el_df = df.drop_duplicates("id").set_index("id")
-    now_cost = (el_df["now_cost"] / 10.0).to_dict()
-    team = el_df["team"].to_dict()
-    pos = el_df["element_type"].to_dict()
+    now_cost = {int(k): float(v)/10.0 for k, v in el_df["now_cost"].to_dict().items()}
+    team = {int(k): int(v) for k, v in el_df["team"].to_dict().items()}
+    pos = {int(k): int(v) for k, v in el_df["element_type"].to_dict().items()}
     
     sell_price = {}
     for i in all_ids:
         nc = now_cost[i]
         if i in picks_data:
-            pp = picks_data[i]["purchase_price"]
+            pp = float(picks_data[i]["purchase_price"])
             profit = max(0.0, nc - pp)
             sell_price[i] = round(pp + np.floor(profit * 10) / 20.0, 1)
         else:
@@ -259,20 +260,20 @@ def solve_multi_period_milp(df, current_ids, bank, free_transfers, active_chip, 
 
     xp_dict = {i: {} for i in all_ids}
     for _, r in df.iterrows():
-        xp_dict[r["id"]][r["gw"]] = r["xP"]
+        xp_dict[int(r["id"])][int(r["gw"])] = float(r["xP"])
 
     prob = pulp.LpProblem("FPL_MultiPeriod_v2_2", pulp.LpMaximize)
 
-    squad = {(i, t): pulp.LpVariable(f"s_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    xi    = {(i, t): pulp.LpVariable(f"x_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    cap   = {(i, t): pulp.LpVariable(f"c_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    vc    = {(i, t): pulp.LpVariable(f"v_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    tin   = {(i, t): pulp.LpVariable(f"in_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
-    tout  = {(i, t): pulp.LpVariable(f"out_{i}_g{t}", cat="Binary") for i in all_ids for t in gws}
+    squad = {(i, t): pulp.LpVariable(f"s_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
+    xi    = {(i, t): pulp.LpVariable(f"x_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
+    cap   = {(i, t): pulp.LpVariable(f"c_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
+    vc    = {(i, t): pulp.LpVariable(f"v_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
+    tin   = {(i, t): pulp.LpVariable(f"in_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
+    tout  = {(i, t): pulp.LpVariable(f"out_{int(i)}_g{int(t)}", cat="Binary") for i in all_ids for t in gws}
     
-    ft_avail = {t: pulp.LpVariable(f"ft_avail_g{t}", lowBound=1, upBound=5, cat="Integer") for t in gws}
-    ft_used  = {t: pulp.LpVariable(f"ft_used_g{t}", lowBound=0, upBound=5, cat="Integer") for t in gws}
-    hits     = {t: pulp.LpVariable(f"hits_g{t}", lowBound=0, cat="Integer") for t in gws}
+    ft_avail = {t: pulp.LpVariable(f"ft_avail_g{int(t)}", lowBound=1, upBound=5, cat="Integer") for t in gws}
+    ft_used  = {t: pulp.LpVariable(f"ft_used_g{int(t)}", lowBound=0, upBound=5, cat="Integer") for t in gws}
+    hits     = {t: pulp.LpVariable(f"hits_g{int(t)}", lowBound=0, cat="Integer") for t in gws}
 
     cur_set = set(current_ids)
     
@@ -398,7 +399,6 @@ avail_chips = [c for c in ["Wildcard", "Free Hit", "Bench Boost", "Triple Captai
 active_chip = st.sidebar.selectbox("⚡ Chip aktif pekan ini:", ["Tanpa Chip"] + avail_chips)
 horizon = st.sidebar.slider("Horizon perencanaan (GW ke depan):", 1, 3, 2)
 
-# FETCH CEPAT: Filter hanya pemain aktif
 with st.spinner("⚡ Mengambil data histori pemain aktif (Fast Engine)..."):
     active_elements = elements[(elements["total_points"] > 0) | (elements["minutes"] > 0)]
     active_ids = active_elements["id"].tolist()
